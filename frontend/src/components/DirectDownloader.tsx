@@ -150,11 +150,11 @@ export function DirectDownloader({
     <section className="hero-section" id="top">
       <div className="hero-copy">
         <h1 className="hero-title">
-          Download FlipHTML5 ke PDF &amp; Offline HTML5
+          Download Flipbook ke PDF &amp; Offline HTML5
         </h1>
         <p className="hero-subtitle">
-          Tempel link buku FlipHTML5, pilih format yang diinginkan, lalu klik
-          download.
+          Tempel link FlipHTML5, AnyFlip, PubHTML5, Heyzine, atau flipbook HTML5
+          lainnya, pilih format, lalu klik download.
         </p>
       </div>
 
@@ -162,7 +162,7 @@ export function DirectDownloader({
         <form className="direct-form" onSubmit={handleDirectDownload}>
           <div className="field-group">
             <label htmlFor="fliphtml5-url-input" className="inspector-label">
-              Link FlipHTML5
+              Link Flipbook
             </label>
             <div className="inspector-row">
               <div className="url-input-wrap">
@@ -173,7 +173,7 @@ export function DirectDownloader({
                   className="url-input"
                   value={url}
                   onChange={(e) => handleUrlEdit(e.target.value)}
-                  placeholder="https://online.fliphtml5.com/account/bookid/"
+                  placeholder="https://online.fliphtml5.com/... atau anyflip.com / pubhtml5.com / heyzine.com"
                   autoComplete="off"
                   spellCheck={false}
                   disabled={downloading}

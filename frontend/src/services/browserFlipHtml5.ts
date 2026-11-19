@@ -1,7 +1,9 @@
 import JSZip from 'jszip';
+import { PDFDocument } from 'pdf-lib';
 import type { OutputFormat, QualityPreset } from '../types';
 import {
   buildPackageFromRawPages,
+  sanitizeBaseName,
   triggerBrowserDownload,
   type RawPageBytes,
 } from './clientBundler';
@@ -16,12 +18,14 @@ export interface BrowserBookMetadata {
   url: string;
   baseUrl: string;
   bookSlug: string;
+  platform: 'fliphtml5' | 'anyflip' | 'pubhtml5' | 'heyzine' | 'html5';
   title: string;
   description: string | null;
   totalPages: number;
   pageWidth: number | null;
   pageHeight: number | null;
   coverUrl: string | null;
+  directPdfUrl?: string | null;
   pages: BrowserPageEntry[];
 }
 
@@ -50,11 +54,12 @@ export interface BrowserDownloadResult {
   blobUrl: string;
 }
 
-interface NormalizedUrl {
+export interface NormalizedBookTarget {
+  platform: 'fliphtml5' | 'anyflip' | 'pubhtml5' | 'heyzine' | 'html5';
+  originalUrl: string;
   normalizedUrl: string;
   baseUrl: string;
-  account: string;
-  bookId: string;
+  alternateBaseUrls: string[];
   slug: string;
 }
 
@@ -92,28 +97,72 @@ const CORS_RELAYS: Array<{ name: string; build: RelayFn }> = [
   },
 ];
 
-// Remembers the fastest working fetch route ('direct' or relay index) for this session
-let preferredRoute: 'direct' | number | null = null;
+// Remembers the fastest working fetch route per origin so different sites never interfere
+const preferredRouteByOrigin = new Map<string, 'direct' | number>();
 let deStringReadyPromise: Promise<boolean> | null = null;
 
-function isAllowedFlipHost(hostname: string): boolean {
-  const host = hostname.trim().toLowerCase().replace(/\.$/, '');
-  return host === 'fliphtml5.com' || host.endsWith('.fliphtml5.com');
-}
+function extractFirstUrlFromInput(rawInput: string): string {
+  const cleaned = rawInput
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .trim();
+  if (!cleaned) return '';
 
-export function normalizeFlipHtml5Url(rawInput: string): NormalizedUrl {
-  const trimmed = rawInput.trim();
-  if (!trimmed) {
-    throw new Error('Masukkan link FlipHTML5 terlebih dahulu.');
+  const httpMatch = cleaned.match(/https?:\/\/[^\s<>"']+/i);
+  if (httpMatch?.[0]) {
+    return httpMatch[0].replace(/[),.;]+$/, '');
   }
 
-  const withProtocol = /^https?:\/\//i.test(trimmed)
-    ? trimmed
-    : `https://${trimmed}`;
+  const bareDomainMatch = cleaned.match(
+    /(?:^|\s)((?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/[^\s<>"']*)?)/i,
+  );
+  if (bareDomainMatch?.[1]) {
+    return `https://${bareDomainMatch[1].replace(/[),.;]+$/, '')}`;
+  }
+
+  return /^https?:\/\//i.test(cleaned) ? cleaned : `https://${cleaned}`;
+}
+
+function getOriginKey(url: string): string {
+  try {
+    return new URL(url).origin.toLowerCase();
+  } catch {
+    return 'default';
+  }
+}
+
+function isDomain(hostname: string, root: string): boolean {
+  const host = hostname.trim().toLowerCase().replace(/\.$/, '');
+  return host === root || host.endsWith(`.${root}`);
+}
+
+function directoryBaseUrl(parsed: URL): string {
+  let pathname = parsed.pathname || '/';
+  // Strip trailing HTML filenames like /index.html or /mobile/index.html
+  pathname = pathname.replace(/\/(?:mobile\/)?index\.html?$/i, '/');
+  pathname = pathname.replace(/\/basic\/?$/i, '/');
+  if (!pathname.endsWith('/')) {
+    const lastSegment = pathname.split('/').pop() ?? '';
+    if (/\.[a-z0-9]{2,5}$/i.test(lastSegment)) {
+      pathname = pathname.slice(0, pathname.lastIndexOf('/') + 1);
+    } else {
+      pathname = `${pathname}/`;
+    }
+  }
+  return `${parsed.origin}${pathname}`;
+}
+
+/**
+ * Normalizes FlipHTML5, AnyFlip, PubHTML5, Heyzine, and custom HTML5 flipbook URLs.
+ */
+export function normalizeFlipHtml5Url(rawInput: string): NormalizedBookTarget {
+  const extracted = extractFirstUrlFromInput(rawInput);
+  if (!extracted) {
+    throw new Error('Masukkan link buku FlipHTML5 / flipbook terlebih dahulu.');
+  }
 
   let parsed: URL;
   try {
-    parsed = new URL(withProtocol);
+    parsed = new URL(extracted);
   } catch {
     throw new Error(
       'Format link tidak valid. Contoh: https://online.fliphtml5.com/account/book/',
@@ -121,45 +170,117 @@ export function normalizeFlipHtml5Url(rawInput: string): NormalizedUrl {
   }
 
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('Hanya mendukung link HTTP/HTTPS FlipHTML5.');
+    throw new Error('Hanya mendukung link HTTP/HTTPS.');
   }
 
-  if (!isAllowedFlipHost(parsed.hostname)) {
-    throw new Error(
-      `Domain "${parsed.hostname}" bukan FlipHTML5. Gunakan link fliphtml5.com atau online.fliphtml5.com.`,
-    );
-  }
-
-  const segments = parsed.pathname
+  const host = parsed.hostname.toLowerCase();
+  const rawSegments = parsed.pathname
     .split('/')
     .map((s) => s.trim())
-    .filter(Boolean)
-    .filter(
-      (s) =>
+    .filter(Boolean);
+
+  // Heyzine flipbooks: https://heyzine.com/flip-book/<id>.html
+  if (isDomain(host, 'heyzine.com')) {
+    const cleanUrl = `${parsed.origin}${parsed.pathname}`;
+    const slug = (rawSegments[rawSegments.length - 1] ?? 'heyzine-book').replace(
+      /\.html?$/i,
+      '',
+    );
+    return {
+      platform: 'heyzine',
+      originalUrl: extracted,
+      normalizedUrl: cleanUrl,
+      baseUrl: directoryBaseUrl(parsed),
+      alternateBaseUrls: [],
+      slug,
+    };
+  }
+
+  // Known Wonder Idea flipbook platforms (FlipHTML5, AnyFlip, PubHTML5)
+  const platformMap: Array<{
+    root: string;
+    onlineHost: string;
+    platform: 'fliphtml5' | 'anyflip' | 'pubhtml5';
+  }> = [
+    { root: 'fliphtml5.com', onlineHost: 'online.fliphtml5.com', platform: 'fliphtml5' },
+    { root: 'anyflip.com', onlineHost: 'online.anyflip.com', platform: 'anyflip' },
+    { root: 'pubhtml5.com', onlineHost: 'online.pubhtml5.com', platform: 'pubhtml5' },
+  ];
+
+  for (const spec of platformMap) {
+    if (!isDomain(host, spec.root)) continue;
+
+    if (
+      rawSegments[0]?.toLowerCase() === 'bookcase' ||
+      rawSegments[0]?.toLowerCase() === 'homepage' ||
+      rawSegments[0]?.toLowerCase() === 'exploring'
+    ) {
+      throw new Error(
+        'Link ini adalah halaman rak buku/profil. Buka salah satu bukunya lalu salin link buku tersebut.',
+      );
+    }
+
+    const filtered = rawSegments.filter(
+      (s, idx) =>
         !/^index\.html?$/i.test(s) &&
         s.toLowerCase() !== 'mobile' &&
-        s.toLowerCase() !== 'basic',
+        s.toLowerCase() !== 'basic' &&
+        !(idx === 0 && s.toLowerCase() === 'books' && rawSegments.length >= 3),
     );
 
-  if (segments.length < 2 || segments[0].toLowerCase() === 'bookcase') {
-    throw new Error(
-      'Link harus mengarah langsung ke buku FlipHTML5 (contoh: https://online.fliphtml5.com/abcd/efgh/).',
-    );
+    if (filtered.length < 2) {
+      throw new Error(
+        `Link belum mengarah ke buku spesifik (contoh: https://${spec.onlineHost}/account/bookid/).`,
+      );
+    }
+
+    const [account, bookId] = filtered;
+    const targetHost =
+      host === `e.${spec.root}` ? host : spec.onlineHost;
+    const baseUrl = `https://${targetHost}/${account}/${bookId}/`;
+    const alternates: string[] = [];
+
+    if (targetHost !== spec.onlineHost) {
+      alternates.push(`https://${spec.onlineHost}/${account}/${bookId}/`);
+    }
+    if (filtered.length > 2) {
+      const fullDir = `https://${targetHost}/${filtered.join('/')}/`;
+      if (fullDir !== baseUrl) alternates.push(fullDir);
+    }
+
+    return {
+      platform: spec.platform,
+      originalUrl: extracted,
+      normalizedUrl: baseUrl,
+      baseUrl,
+      alternateBaseUrls: alternates,
+      slug: `${decodeURIComponentSafe(account)}-${decodeURIComponentSafe(bookId)}`,
+    };
   }
 
-  const [account, bookId] = segments;
-  if (!/^[a-zA-Z0-9._-]+$/.test(account) || !/^[a-zA-Z0-9._-]+$/.test(bookId)) {
-    throw new Error('Link FlipHTML5 mengandung karakter path yang tidak valid.');
-  }
+  // Generic / self-hosted HTML5 flipbook (FlipBuilder, custom domain FlipHTML5, FlipPDF, etc.)
+  const baseUrl = directoryBaseUrl(parsed);
+  const slugParts = rawSegments
+    .filter((s) => !/^index\.html?$/i.test(s) && s.toLowerCase() !== 'mobile')
+    .slice(-2)
+    .map(decodeURIComponentSafe);
 
-  const baseUrl = `https://online.fliphtml5.com/${account}/${bookId}/`;
   return {
+    platform: 'html5',
+    originalUrl: extracted,
     normalizedUrl: baseUrl,
     baseUrl,
-    account,
-    bookId,
-    slug: `${account}-${bookId}`,
+    alternateBaseUrls: [],
+    slug: slugParts.join('-') || host,
   };
+}
+
+function decodeURIComponentSafe(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 export function parsePageRange(
@@ -213,8 +334,7 @@ export function parsePageRange(
 }
 
 /**
- * Resolves a FlipHTML5 asset path safely against the book's baseUrl,
- * normalizing leading `./` and `../` segments from config.js.
+ * Resolves a relative or absolute flipbook asset path safely against the book's baseUrl.
  */
 function resolveAssetUrl(assetPath: string, baseUrl: string): string | null {
   const cleaned = assetPath.trim();
@@ -229,10 +349,7 @@ function resolveAssetUrl(assetPath: string, baseUrl: string): string | null {
       const normalizedRel = cleaned.replace(/^(?:\.\.\/|\.\/|\/)+/, '');
       resolved = new URL(normalizedRel, baseUrl);
     }
-    if (
-      (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') ||
-      !isAllowedFlipHost(resolved.hostname)
-    ) {
+    if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') {
       return null;
     }
     return resolved.toString();
@@ -273,16 +390,28 @@ function isZipBuffer(bytes: Uint8Array): boolean {
 
 function loadScriptTag(src: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${src}"]`);
-    if (existing) {
+    const existing = document.querySelector<HTMLScriptElement>(
+      `script[src="${src}"]`,
+    );
+    if (existing && existing.dataset.loaded === 'true') {
       resolve();
       return;
     }
+    if (existing) {
+      existing.remove();
+    }
+
     const script = document.createElement('script');
     script.src = src;
     script.async = true;
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
+    script.onload = () => {
+      script.dataset.loaded = 'true';
+      resolve();
+    };
+    script.onerror = () => {
+      script.remove();
+      reject(new Error(`Failed to load script: ${src}`));
+    };
     document.head.appendChild(script);
   });
 }
@@ -295,8 +424,6 @@ function getDeStringHandles(): {
 } | null {
   const win = window as DeStringWindow;
   const mod = win.Module;
-  // Critical: Emscripten exports _DeString & allocateUTF8 BEFORE WASM runtime initializes.
-  // Calling allocateUTF8 before `calledRun` is true throws "malloc called before runtime initialization".
   if (!mod || !mod.calledRun) {
     return null;
   }
@@ -319,29 +446,31 @@ function getDeStringHandles(): {
   return null;
 }
 
-/**
- * Loads FlipHTML5's official self-contained deString.js WASM decoder and waits
- * until the Emscripten WASM runtime (`Module.calledRun === true`) is fully ready.
- */
 async function ensureDeStringLoaded(): Promise<boolean> {
   if (getDeStringHandles()) return true;
   if (deStringReadyPromise) return deStringReadyPromise;
 
-  deStringReadyPromise = (async () => {
-    try {
-      await loadScriptTag(
-        'https://static.fliphtml5.com/resourceFiles/html5_templates/js/deString.js',
-      );
+  const cdnCandidates = [
+    'https://static.fliphtml5.com/resourceFiles/html5_templates/js/deString.js',
+    'https://static.anyflip.com/resourceFiles/html5_templates/js/deString.js',
+    'https://static.pubhtml5.com/resourceFiles/html5_templates/js/deString.js',
+  ];
 
-      const deadline = Date.now() + 15000;
-      while (Date.now() < deadline) {
+  deStringReadyPromise = (async () => {
+    for (const src of cdnCandidates) {
+      try {
+        await loadScriptTag(src);
+        const deadline = Date.now() + 12000;
+        while (Date.now() < deadline) {
+          if (getDeStringHandles()) return true;
+          await new Promise((r) => setTimeout(r, 60));
+        }
         if (getDeStringHandles()) return true;
-        await new Promise((r) => setTimeout(r, 60));
+      } catch {
+        // Try next official template CDN
       }
-      return Boolean(getDeStringHandles());
-    } catch {
-      return false;
     }
+    return Boolean(getDeStringHandles());
   })();
 
   const ok = await deStringReadyPromise;
@@ -351,10 +480,6 @@ async function ensureDeStringLoaded(): Promise<boolean> {
   return ok;
 }
 
-/**
- * Decodes an encoded FlipHTML5 string (`bookConfig`, `fliphtml5_pages`, or `meta`)
- * into a parsed JSON object or array, stripping any trailing checksum suffix.
- */
 async function decodeFlipStringToJson<T>(
   encoded: string,
   expectedType: 'array' | 'object',
@@ -389,8 +514,7 @@ async function decodeFlipStringToJson<T>(
       return null;
     }
 
-    const slice = decoded.slice(startIdx, endIdx + 1);
-    return JSON.parse(slice) as T;
+    return JSON.parse(decoded.slice(startIdx, endIdx + 1)) as T;
   } catch {
     return null;
   } finally {
@@ -402,8 +526,13 @@ async function decodeFlipStringToJson<T>(
   }
 }
 
-function extractBalancedJson(source: string, startIndex: number): string | null {
-  const open = source.indexOf('{', startIndex);
+function extractBalancedBlock(
+  source: string,
+  startIndex: number,
+  openChar: '{' | '[',
+  closeChar: '}' | ']',
+): string | null {
+  const open = source.indexOf(openChar, startIndex);
   if (open === -1) return null;
 
   let depth = 0;
@@ -422,14 +551,36 @@ function extractBalancedJson(source: string, startIndex: number): string | null 
     if (ch === '"' || ch === "'") {
       inStr = true;
       quote = ch;
-    } else if (ch === '{') {
+    } else if (ch === openChar) {
       depth += 1;
-    } else if (ch === '}') {
+    } else if (ch === closeChar) {
       depth -= 1;
       if (depth === 0) return source.slice(open, i + 1);
     }
   }
   return null;
+}
+
+/**
+ * Parses strict JSON OR relaxed JS object literals (single quotes, unquoted keys,
+ * trailing commas) used by older FlipHTML5/FlipPDF config.js files.
+ */
+function parseRelaxedJson<T>(rawBlock: string): T | null {
+  try {
+    return JSON.parse(rawBlock) as T;
+  } catch {
+    try {
+      const normalized = rawBlock
+        .replace(/,\s*([}\]])/g, '$1')
+        .replace(/([{,]\s*)([a-zA-Z0-9_$]+)\s*:/g, '$1"$2":')
+        .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, inner: string) =>
+          JSON.stringify(inner.replace(/\\'/g, "'")),
+        );
+      return JSON.parse(normalized) as T;
+    } catch {
+      return null;
+    }
+  }
 }
 
 function parsePositiveInt(val: unknown): number | null {
@@ -610,7 +761,10 @@ function pickBestTitle(
   const cleanMeta = metaTitle?.trim() || '';
   const cleanBook = bookTitle?.trim() || '';
   const isGeneric = (val: string) =>
-    !val || /^fliphtml5$/i.test(val) || /^untitled$/i.test(val);
+    !val ||
+    /^(fliphtml5|flipbook|anyflip|pubhtml5|untitled|online\.fliphtml5\.com)$/i.test(
+      val,
+    );
 
   if (!isGeneric(cleanMeta)) return cleanMeta;
   if (!isGeneric(cleanBook)) return cleanBook;
@@ -619,22 +773,21 @@ function pickBestTitle(
 
 async function parseConfigText(
   scriptText: string,
-  normalized: NormalizedUrl,
+  target: NormalizedBookTarget,
+  baseUrl: string,
 ): Promise<{ metadata: BrowserBookMetadata; hasExplicitPages: boolean } | null> {
-  const marker = scriptText.search(/(?:var|let|const|window\.)\s*htmlConfig\s*=/);
   let parsed: RawConfig | null = null;
-  if (marker !== -1) {
-    const jsonStr = extractBalancedJson(scriptText, marker);
+  const htmlConfigMarker = scriptText.search(
+    /(?:var|let|const|window\.)\s*htmlConfig\s*=/,
+  );
+  if (htmlConfigMarker !== -1) {
+    const jsonStr = extractBalancedBlock(scriptText, htmlConfigMarker, '{', '}');
     if (jsonStr) {
-      try {
-        parsed = JSON.parse(jsonStr) as RawConfig;
-      } catch {
-        parsed = null;
-      }
+      parsed = parseRelaxedJson<RawConfig>(jsonStr);
     }
   }
 
-  // Decode meta if it's an encoded string
+  // Decode or parse meta
   let meta: RawMetaObj | undefined;
   if (typeof parsed?.meta === 'string' && parsed.meta.trim()) {
     meta =
@@ -644,7 +797,7 @@ async function parseConfigText(
     meta = parsed.meta;
   }
 
-  // Decode bookConfig if it's an encoded string (standard in 2025/2026 FlipHTML5 books!)
+  // Decode or parse bookConfig (supports both htmlConfig.bookConfig and legacy standalone `var bookConfig = {...}`)
   let bookConfig: RawBookConfigObj | undefined;
   if (typeof parsed?.bookConfig === 'string' && parsed.bookConfig.trim()) {
     bookConfig =
@@ -654,9 +807,19 @@ async function parseConfigText(
       )) ?? undefined;
   } else if (parsed?.bookConfig && typeof parsed.bookConfig === 'object') {
     bookConfig = parsed.bookConfig;
+  } else {
+    const bcMarker = scriptText.search(
+      /(?:var|let|const|window\.)\s*bookConfig\s*=/,
+    );
+    if (bcMarker !== -1) {
+      const bcBlock = extractBalancedBlock(scriptText, bcMarker, '{', '}');
+      if (bcBlock) {
+        bookConfig = parseRelaxedJson<RawBookConfigObj>(bcBlock) ?? undefined;
+      }
+    }
   }
 
-  // Decode fliphtml5_pages (can be array OR encoded string)
+  // Decode or parse fliphtml5_pages (array OR encoded string, inside htmlConfig OR standalone)
   let rawPages: RawPageItem[] = [];
   const rawField = parsed?.fliphtml5_pages ?? bookConfig?.fliphtml5_pages;
 
@@ -672,23 +835,27 @@ async function parseConfigText(
     }
   }
 
-  // Fallback regex for standalone `var fliphtml5_pages = [...]` or `= "..."`
   if (rawPages.length === 0) {
-    const arrMatch = scriptText.match(/fliphtml5_pages\s*=\s*(\[[\s\S]*?\])\s*;/);
-    if (arrMatch?.[1]) {
-      try {
-        const arr = JSON.parse(arrMatch[1]);
-        if (Array.isArray(arr)) rawPages = arr as RawPageItem[];
-      } catch {
-        // Ignore malformed array
+    const pagesMarker = scriptText.search(
+      /(?:var|let|const|window\.)?\s*fliphtml5_pages\s*[:=]\s*\[/,
+    );
+    if (pagesMarker !== -1) {
+      const arrBlock = extractBalancedBlock(scriptText, pagesMarker, '[', ']');
+      if (arrBlock) {
+        const arr = parseRelaxedJson<RawPageItem[]>(arrBlock);
+        if (Array.isArray(arr)) rawPages = arr;
       }
     }
   }
 
   if (rawPages.length === 0) {
     const strMatch =
-      scriptText.match(/["']?fliphtml5_pages["']?\s*[:=]\s*"((?:[^"\\]|\\.){20,})"/) ??
-      scriptText.match(/["']?fliphtml5_pages["']?\s*[:=]\s*'((?:[^'\\]|\\.){20,})'/);
+      scriptText.match(
+        /["']?fliphtml5_pages["']?\s*[:=]\s*"((?:[^"\\]|\\.){20,})"/,
+      ) ??
+      scriptText.match(
+        /["']?fliphtml5_pages["']?\s*[:=]\s*'((?:[^'\\]|\\.){20,})'/,
+      );
     if (strMatch?.[1]) {
       let rawEncoded = strMatch[1];
       try {
@@ -724,7 +891,7 @@ async function parseConfigText(
   const title = pickBestTitle(
     meta?.title,
     bookConfig?.bookTitle || titleMatch?.[1],
-    normalized.slug,
+    target.slug,
   );
   const description =
     meta?.description?.trim() || bookConfig?.bookDescription?.trim() || null;
@@ -758,12 +925,7 @@ async function parseConfigText(
       for (const entry of list) {
         if (typeof entry === 'string' && entry.trim()) {
           pushUnique(
-            buildAssetCandidates(
-              entry,
-              normalized.baseUrl,
-              largePaths,
-              normalPaths,
-            ),
+            buildAssetCandidates(entry, baseUrl, largePaths, normalPaths),
           );
         }
       }
@@ -775,7 +937,7 @@ async function parseConfigText(
         item.t.includes('/') || /^https?:\/\//i.test(item.t)
           ? item.t
           : `files/thumb/${item.t}`,
-        normalized.baseUrl,
+        baseUrl,
         thumbPaths,
         [],
       );
@@ -786,7 +948,7 @@ async function parseConfigText(
     pushUnique(
       buildNumberedFallbackCandidates(
         pageNumber,
-        normalized.baseUrl,
+        baseUrl,
         largePaths,
         normalPaths,
       ),
@@ -799,9 +961,10 @@ async function parseConfigText(
   return {
     hasExplicitPages: rawPages.length > 0,
     metadata: {
-      url: normalized.normalizedUrl,
-      baseUrl: normalized.baseUrl,
-      bookSlug: normalized.slug,
+      url: target.normalizedUrl,
+      baseUrl,
+      bookSlug: target.slug,
+      platform: target.platform,
       title,
       description,
       totalPages,
@@ -813,10 +976,76 @@ async function parseConfigText(
   };
 }
 
+function extractConfigScriptUrlsFromHtml(html: string, baseUrl: string): string[] {
+  const urls: string[] = [];
+  const regex = /<script[^>]+src=["']([^"']*config[^"']*\.js[^"']*)["']/gi;
+  let match: RegExpExecArray | null = regex.exec(html);
+  while (match) {
+    const resolved = resolveAssetUrl(match[1], baseUrl);
+    if (resolved && !urls.includes(resolved)) {
+      urls.push(resolved);
+    }
+    match = regex.exec(html);
+  }
+  return urls;
+}
+
+function parseHeyzineHtml(
+  html: string,
+  target: NormalizedBookTarget,
+): BrowserBookMetadata | null {
+  const pdfRelMatch =
+    html.match(/https?:\/\/[^"'\\\s]+\.pdf(?:\?[^"'\\\s]*)?/i) ??
+    html.match(/files\/uploaded\/[^"'\\\s]+\.pdf/i);
+  if (!pdfRelMatch?.[0]) return null;
+
+  const rawPdf = pdfRelMatch[0].replace(/\\\//g, '/');
+  const directPdfUrl = /^https?:\/\//i.test(rawPdf)
+    ? rawPdf
+    : `https://cdnm.heyzine.com/${rawPdf.replace(/^\/+/, '')}`;
+
+  const ogTitle = html.match(
+    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
+  )?.[1];
+  const titleTag = html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1];
+  const ogImage = html.match(
+    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+  )?.[1];
+  const pageCount =
+    parsePositiveInt(html.match(/\\?["']?pages\\?["']?\s*:\s*(\d+)/i)?.[1]) ?? 1;
+
+  const title = (ogTitle || titleTag || target.slug)
+    .replace(/\s*\|\s*PDF to Flipbook.*$/i, '')
+    .replace(/\s*[-|]\s*Heyzine\s*$/i, '')
+    .trim();
+
+  return {
+    url: target.normalizedUrl,
+    baseUrl: target.baseUrl,
+    bookSlug: target.slug,
+    platform: 'heyzine',
+    title: title || target.slug,
+    description: null,
+    totalPages: pageCount,
+    pageWidth: null,
+    pageHeight: null,
+    coverUrl: ogImage?.trim() || null,
+    directPdfUrl,
+    pages: [],
+  };
+}
+
 async function parseHtmlText(
   html: string,
-  normalized: NormalizedUrl,
+  target: NormalizedBookTarget,
+  baseUrl: string,
+  signal?: AbortSignal,
 ): Promise<BrowserBookMetadata | null> {
+  if (target.platform === 'heyzine' || html.includes('cdnm.heyzine.com')) {
+    const heyzine = parseHeyzineHtml(html, target);
+    if (heyzine) return heyzine;
+  }
+
   const ogTitle = html.match(
     /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
   )?.[1];
@@ -829,18 +1058,41 @@ async function parseHtmlText(
   )?.[1];
 
   const htmlTitle = (ogTitle || titleTag || '')
-    .replace(/\s*[-|]\s*FlipHTML5\s*$/i, '')
+    .replace(/\s*[-|]\s*(?:FlipHTML5|AnyFlip|PubHTML5)\s*$/i, '')
     .trim();
-  const resolvedOgImg = ogImage
-    ? resolveAssetUrl(ogImage, normalized.baseUrl)
-    : null;
+  const resolvedOgImg = ogImage ? resolveAssetUrl(ogImage, baseUrl) : null;
 
-  const inline = await parseConfigText(html, normalized);
+  // Discover any custom-path config.js linked in the HTML page
+  const scriptUrls = extractConfigScriptUrlsFromHtml(html, baseUrl);
+  for (const scriptUrl of scriptUrls) {
+    try {
+      const res = await smartFetch(scriptUrl, signal);
+      if (res.ok) {
+        const scriptText = await res.text();
+        const cfg = await parseConfigText(scriptText, target, baseUrl);
+        if (cfg) {
+          return {
+            ...cfg.metadata,
+            title:
+              cfg.metadata.title === target.slug && htmlTitle
+                ? htmlTitle
+                : cfg.metadata.title,
+            description: cfg.metadata.description ?? (ogDesc?.trim() || null),
+            coverUrl: cfg.metadata.coverUrl ?? resolvedOgImg,
+          };
+        }
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') throw error;
+    }
+  }
+
+  const inline = await parseConfigText(html, target, baseUrl);
   if (inline) {
     return {
       ...inline.metadata,
       title:
-        inline.metadata.title === normalized.slug && htmlTitle
+        inline.metadata.title === target.slug && htmlTitle
           ? htmlTitle
           : inline.metadata.title,
       description: inline.metadata.description ?? (ogDesc?.trim() || null),
@@ -858,7 +1110,7 @@ async function parseHtmlText(
     const pageNumber = i + 1;
     const candidates = buildNumberedFallbackCandidates(
       pageNumber,
-      normalized.baseUrl,
+      baseUrl,
       [],
       [],
     );
@@ -866,10 +1118,11 @@ async function parseHtmlText(
   });
 
   return {
-    url: normalized.normalizedUrl,
-    baseUrl: normalized.baseUrl,
-    bookSlug: normalized.slug,
-    title: htmlTitle || normalized.slug,
+    url: target.normalizedUrl,
+    baseUrl,
+    bookSlug: target.slug,
+    platform: target.platform,
+    title: htmlTitle || target.slug,
     description: ogDesc?.trim() || null,
     totalPages,
     pageWidth: null,
@@ -906,11 +1159,14 @@ async function smartFetch(
   targetUrl: string,
   signal?: AbortSignal,
 ): Promise<Response> {
+  const originKey = getOriginKey(targetUrl);
+  const preferred = preferredRouteByOrigin.get(originKey) ?? null;
+
   const order: Array<'direct' | number> = [];
-  if (preferredRoute !== null) order.push(preferredRoute);
-  if (preferredRoute !== 'direct') order.push('direct');
+  if (preferred !== null) order.push(preferred);
+  if (preferred !== 'direct') order.push('direct');
   for (let i = 0; i < CORS_RELAYS.length; i += 1) {
-    if (preferredRoute !== i) order.push(i);
+    if (preferred !== i) order.push(i);
   }
 
   let lastResponse: Response | null = null;
@@ -922,12 +1178,12 @@ async function smartFetch(
     try {
       const response = await fetchWithTimeout(url, 18000, signal);
       if (response.ok) {
-        preferredRoute = route;
+        preferredRouteByOrigin.set(originKey, route);
         return response;
       }
       if (response.status === 404) {
         lastResponse = response;
-        if (route === preferredRoute || route === 'direct') {
+        if (route === preferred || route === 'direct') {
           return response;
         }
         continue;
@@ -937,14 +1193,14 @@ async function smartFetch(
         if (route === 'direct') {
           return response;
         }
-        if (route === preferredRoute) {
-          preferredRoute = null;
+        if (route === preferred) {
+          preferredRouteByOrigin.delete(originKey);
         }
         continue;
       }
       if (response.status === 429 || response.status >= 500) {
-        if (route === preferredRoute) {
-          preferredRoute = null;
+        if (route === preferred) {
+          preferredRouteByOrigin.delete(originKey);
         }
       }
     } catch (error) {
@@ -960,7 +1216,7 @@ async function smartFetch(
 
   if (lastResponse) return lastResponse;
   throw new Error(
-    'Gagal terhubung ke FlipHTML5. Pastikan link benar dan koneksi internet stabil.',
+    'Gagal terhubung ke situs buku. Pastikan link valid, publik, dan koneksi internet stabil.',
   );
 }
 
@@ -968,32 +1224,64 @@ export async function inspectBookInBrowser(
   rawUrl: string,
   signal?: AbortSignal,
 ): Promise<BrowserBookMetadata> {
-  const normalized = normalizeFlipHtml5Url(rawUrl);
+  const target = normalizeFlipHtml5Url(rawUrl);
 
-  const configUrls = [
-    `${normalized.baseUrl}javascript/config.js`,
-    `${normalized.baseUrl}mobile/javascript/config.js`,
-  ];
+  // Heyzine exposes its config & PDF link inside its HTML page
+  if (target.platform === 'heyzine') {
+    const htmlRes = await smartFetch(target.normalizedUrl, signal);
+    if (!htmlRes.ok) {
+      throw new Error(`Gagal membuka link Heyzine (HTTP ${htmlRes.status}).`);
+    }
+    const html = await htmlRes.text();
+    const meta = parseHeyzineHtml(html, target);
+    if (!meta) {
+      throw new Error(
+        'Publikasi Heyzine ini tidak dapat diunduh langsung (mungkin privat atau dilindungi).',
+      );
+    }
+    return meta;
+  }
 
+  const baseCandidates = [target.baseUrl, ...target.alternateBaseUrls];
   let fallbackMeta: BrowserBookMetadata | null = null;
 
-  for (const configUrl of configUrls) {
-    try {
-      const res = await smartFetch(configUrl, signal);
-      if (res.ok) {
-        const text = await res.text();
-        const result = await parseConfigText(text, normalized);
-        if (result) {
-          if (result.hasExplicitPages) {
-            return result.metadata;
+  for (const baseUrl of baseCandidates) {
+    const configPaths =
+      target.platform === 'anyflip'
+        ? [
+            'mobile/javascript/config.js',
+            'javascript/config.js',
+            'files/javascript/config.js',
+          ]
+        : [
+            'javascript/config.js',
+            'mobile/javascript/config.js',
+            'files/javascript/config.js',
+          ];
+
+    for (const relPath of configPaths) {
+      try {
+        const res = await smartFetch(`${baseUrl}${relPath}`, signal);
+        if (res.ok) {
+          const text = await res.text();
+          if (/<title>\s*FlipHtml5 Online Service Error/i.test(text)) {
+            continue;
           }
-          if (!fallbackMeta) {
-            fallbackMeta = result.metadata;
+          const result = await parseConfigText(text, target, baseUrl);
+          if (result) {
+            if (result.hasExplicitPages) {
+              return result.metadata;
+            }
+            if (!fallbackMeta) {
+              fallbackMeta = result.metadata;
+            }
           }
         }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          throw error;
+        }
       }
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') throw error;
     }
   }
 
@@ -1001,22 +1289,29 @@ export async function inspectBookInBrowser(
     return fallbackMeta;
   }
 
-  const htmlRes = await smartFetch(normalized.baseUrl, signal);
+  // Fallback: fetch main HTML page and discover linked config.js / inline metadata
+  const htmlRes = await smartFetch(target.normalizedUrl, signal);
   if (htmlRes.status === 404) {
-    throw new Error('Buku FlipHTML5 tidak ditemukan (404). Cek kembali link-nya.');
+    throw new Error('Buku tidak ditemukan (404). Cek kembali link-nya.');
   }
   if (htmlRes.status === 401 || htmlRes.status === 403) {
-    throw new Error('Buku FlipHTML5 ini bersifat privat atau dilindungi kata sandi.');
+    throw new Error('Publikasi ini bersifat privat atau dibatasi aksesnya.');
   }
   if (!htmlRes.ok) {
-    throw new Error(`FlipHTML5 merespons dengan status HTTP ${htmlRes.status}.`);
+    throw new Error(`Server merespons dengan status HTTP ${htmlRes.status}.`);
   }
 
   const html = await htmlRes.text();
-  const parsed = await parseHtmlText(html, normalized);
+  if (/FlipHtml5 Online Service Error|\/check\//i.test(html) && !html.includes('config.js')) {
+    throw new Error(
+      'Buku FlipHTML5 ini sudah dihapus, dipindahkan, atau tidak bersifat publik.',
+    );
+  }
+
+  const parsed = await parseHtmlText(html, target, target.baseUrl, signal);
   if (!parsed) {
     throw new Error(
-      'Daftar halaman buku FlipHTML5 tidak dapat dibaca. Pastikan publikasi bersifat publik.',
+      'Daftar halaman buku tidak ditemukan. Pastikan link mengarah langsung ke buku publik (FlipHTML5, AnyFlip, PubHTML5, atau Heyzine).',
     );
   }
   return parsed;
@@ -1087,10 +1382,101 @@ async function fetchPageBytes(
 
 export function getDisplayImageUrl(rawUrl: string | null): string | null {
   if (!rawUrl) return null;
-  if (preferredRoute !== null && preferredRoute !== 'direct') {
-    return CORS_RELAYS[preferredRoute].build(rawUrl);
+  const route = preferredRouteByOrigin.get(getOriginKey(rawUrl));
+  if (route !== undefined && route !== 'direct') {
+    return CORS_RELAYS[route].build(rawUrl);
   }
   return rawUrl;
+}
+
+async function downloadDirectPdfBook(options: {
+  book: BrowserBookMetadata;
+  format: OutputFormat;
+  quality: QualityPreset;
+  pageRange: string;
+  finalTitle: string;
+  onProgress: (state: BrowserDownloadProgress) => void;
+  signal?: AbortSignal;
+}): Promise<BrowserDownloadResult> {
+  const { book, quality, pageRange, finalTitle, onProgress, signal } = options;
+  if (!book.directPdfUrl) {
+    throw new Error('URL PDF langsung tidak tersedia.');
+  }
+
+  onProgress({
+    phase: 'downloading',
+    progress: 35,
+    label: 'Mengunduh file PDF asli...',
+    downloadedPages: 0,
+    selectedPages: book.totalPages,
+    totalPages: book.totalPages,
+    title: finalTitle,
+  });
+
+  const response = await smartFetch(book.directPdfUrl, signal);
+  if (!response.ok) {
+    throw new Error(`Gagal mengunduh PDF (HTTP ${response.status}).`);
+  }
+
+  const rawBytes = new Uint8Array(await response.arrayBuffer());
+  let finalBytes = rawBytes;
+  let actualTotal = book.totalPages;
+  let selectedCount = book.totalPages;
+
+  // Slice pages cleanly if user specified a custom page range
+  const trimmedRange = pageRange.trim().toLowerCase();
+  if (trimmedRange && trimmedRange !== 'all' && trimmedRange !== '*' && trimmedRange !== 'semua') {
+    onProgress({
+      phase: 'packaging',
+      progress: 75,
+      label: 'Memilih halaman sesuai rentang...',
+      downloadedPages: book.totalPages,
+      selectedPages: book.totalPages,
+      totalPages: book.totalPages,
+      title: finalTitle,
+    });
+    const srcDoc = await PDFDocument.load(rawBytes);
+    actualTotal = srcDoc.getPageCount();
+    const chosen = parsePageRange(pageRange, actualTotal);
+    selectedCount = chosen.length;
+    const outDoc = await PDFDocument.create();
+    const copied = await outDoc.copyPages(
+      srcDoc,
+      chosen.map((p) => p - 1),
+    );
+    copied.forEach((p) => outDoc.addPage(p));
+    finalBytes = new Uint8Array(await outDoc.save());
+  }
+
+  const blob = new Blob([new Uint8Array(finalBytes)], { type: 'application/pdf' });
+  const filename = `${sanitizeBaseName(finalTitle)}.pdf`;
+  triggerBrowserDownload(blob, filename);
+  const blobUrl = URL.createObjectURL(blob);
+
+  onProgress({
+    phase: 'completed',
+    progress: 100,
+    label: `Selesai! ${filename} langsung terunduh.`,
+    downloadedPages: selectedCount,
+    selectedPages: selectedCount,
+    totalPages: actualTotal,
+    title: finalTitle,
+  });
+
+  return {
+    url: book.url,
+    bookSlug: book.bookSlug,
+    title: finalTitle,
+    format: 'pdf',
+    quality,
+    pageRange: selectedCount === actualTotal ? 'all' : pageRange.trim() || 'all',
+    totalPages: actualTotal,
+    selectedPages: selectedCount,
+    skippedPages: 0,
+    filename,
+    fileSize: blob.size,
+    blobUrl,
+  };
 }
 
 export async function downloadFlipBookDirectly(options: {
@@ -1117,7 +1503,7 @@ export async function downloadFlipBookDirectly(options: {
   onProgress({
     phase: 'fetching_meta',
     progress: 5,
-    label: 'Membaca daftar halaman FlipHTML5...',
+    label: 'Membaca daftar halaman buku...',
     downloadedPages: 0,
     selectedPages: 0,
     totalPages: prefetchedBook?.totalPages ?? 0,
@@ -1125,8 +1511,27 @@ export async function downloadFlipBookDirectly(options: {
   });
 
   const book = prefetchedBook ?? (await inspectBookInBrowser(url, signal));
-  const selectedNumbers = parsePageRange(pageRange, book.totalPages);
   const finalTitle = customTitle?.trim() || book.title;
+
+  // Heyzine / direct-PDF flipbooks
+  if (book.directPdfUrl && book.pages.length === 0) {
+    if (format === 'html5') {
+      throw new Error(
+        'Publikasi Heyzine ini menyediakan PDF langsung. Pilih format Dokumen PDF (.pdf) untuk mengunduhnya.',
+      );
+    }
+    return downloadDirectPdfBook({
+      book,
+      format,
+      quality,
+      pageRange,
+      finalTitle,
+      onProgress,
+      signal,
+    });
+  }
+
+  const selectedNumbers = parsePageRange(pageRange, book.totalPages);
 
   onProgress({
     phase: 'downloading',
