@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: flipdown-html5downloader
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: FLIPDOWN_CONCURRENCY
+        value: 4

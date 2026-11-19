@@ -1,19 +1,34 @@
-import { BookMarked } from 'lucide-react';
+import { BookMarked, Settings2 } from 'lucide-react';
+import { isGitHubPagesHost } from '../api/client';
 
 interface HeaderProps {
   apiOnline: boolean | null;
   jobCount: number;
+  settingsOpen: boolean;
+  onToggleSettings: () => void;
 }
 
-export function Header({ apiOnline, jobCount }: HeaderProps) {
+export function Header({
+  apiOnline,
+  jobCount,
+  settingsOpen,
+  onToggleSettings,
+}: HeaderProps) {
+  const staticHost = isGitHubPagesHost();
   const statusClass =
-    apiOnline === true ? 'online' : apiOnline === false ? 'offline' : '';
+    apiOnline === true
+      ? 'online'
+      : apiOnline === false && !staticHost
+        ? 'offline'
+        : 'static';
   const statusLabel =
     apiOnline === true
-      ? 'API Ready'
-      : apiOnline === false
-        ? 'API Offline'
-        : 'Checking API';
+      ? 'Backend Ready'
+      : staticHost
+        ? 'Static Mode'
+        : apiOnline === false
+          ? 'Backend Offline'
+          : 'Checking API';
 
   return (
     <header className="site-header">
@@ -27,13 +42,22 @@ export function Header({ apiOnline, jobCount }: HeaderProps) {
         </a>
 
         <nav className="header-meta" aria-label="Primary">
-          <a href="#archive-history" className="nav-link">
-            Archive ({jobCount})
-          </a>
-          <span className="status-indicator" title="Backend API status">
+          {jobCount > 0 && (
+            <a href="#archive-history" className="nav-link">
+              Archive ({jobCount})
+            </a>
+          )}
+          <button
+            id="backend-settings-btn"
+            type="button"
+            className={`status-btn ${settingsOpen ? 'active' : ''}`}
+            onClick={onToggleSettings}
+            title="Configure FlipDown Backend API URL"
+          >
             <span className={`status-dot ${statusClass}`} aria-hidden="true" />
             <span>{statusLabel}</span>
-          </span>
+            <Settings2 size={14} aria-hidden="true" />
+          </button>
         </nav>
       </div>
     </header>

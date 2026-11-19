@@ -1,6 +1,13 @@
 # FlipDown — FlipHTML5 Downloader Web Application
 
-Full-stack web application for inspecting public **FlipHTML5** publications and archiving them into **PDF documents (`.pdf`)** or **standalone Offline HTML5 Flipbook packages (`.zip`)**, powered by an Express + TypeScript backend, Node.js built-in SQLite (`node:sqlite`), and a React + Vite frontend.
+**Live Web App (GitHub Pages):** https://sanciao4456.github.io/HTML5DOWNLOADER/
+
+Full-stack web application for inspecting public **FlipHTML5** publications and archiving them into **PDF documents (`.pdf`)** or **standalone Offline HTML5 Flipbook packages (`.zip`)**, powered by an Express + TypeScript backend, Node.js built-in SQLite (`node:sqlite`), and a React + Vite frontend with built-in zero-server browser studio support.
+
+## Modes
+
+- **Browser Studio (works directly on GitHub Pages with no server):** Drop page images directly in your browser to compile a **PDF** or **Offline HTML5 Flipbook `.zip`** locally using `pdf-lib` and `JSZip` (nothing leaves your device).
+- **Full Backend Mode (FlipHTML5 URL scraping + SQLite history):** Run locally (`npm start`) or deploy `Dockerfile` / `render.yaml` to Render/Railway, then enter your backend URL in the top-right **Static Mode / Backend Settings** button on GitHub Pages.
 
 ## Features
 

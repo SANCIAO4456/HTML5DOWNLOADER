@@ -6,16 +6,67 @@ import type {
   QualityPreset,
 } from '../types';
 
-const API_BASE = '/api';
+const API_BASE_STORAGE_KEY = 'flipdown_custom_api_base';
 
-async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
-  });
+export function isGitHubPagesHost(): boolean {
+  if (typeof window === 'undefined') return false;
+  return window.location.hostname.endsWith('.github.io');
+}
+
+export function getCustomApiBase(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    return (window.localStorage.getItem(API_BASE_STORAGE_KEY) ?? '').trim();
+  } catch {
+    return '';
+  }
+}
+
+export function setCustomApiBase(rawUrl: string): string {
+  const normalized = rawUrl.trim().replace(/\/+$/, '').replace(/\/api$/i, '');
+  if (typeof window !== 'undefined') {
+    try {
+      if (normalized) {
+        window.localStorage.setItem(API_BASE_STORAGE_KEY, normalized);
+      } else {
+        window.localStorage.removeItem(API_BASE_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage quota / privacy mode errors
+    }
+  }
+  return normalized;
+}
+
+export function resolveApiPrefix(): string {
+  const custom = getCustomApiBase();
+  if (custom) return `${custom}/api`;
+  return '/api';
+}
+
+export function hasConfiguredBackend(): boolean {
+  if (getCustomApiBase()) return true;
+  return !isGitHubPagesHost();
+}
+
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const url = `${resolveApiPrefix()}${path}`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch {
+    throw new Error(
+      isGitHubPagesHost() && !getCustomApiBase()
+        ? 'GitHub Pages hosts static files only. Connect a running FlipDown Backend URL (top-right Settings) to inspect FlipHTML5 links, or switch to the Local Pages Studio tab.'
+        : 'Unable to reach the FlipDown Backend API. Verify that the server is running and CORS is enabled.',
+    );
+  }
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -28,17 +79,30 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
-export async function checkHealth(): Promise<boolean> {
+export async function checkHealth(overrideBase?: string): Promise<boolean> {
+  const prefix =
+    overrideBase !== undefined
+      ? overrideBase.trim()
+        ? `${overrideBase.trim().replace(/\/+$/, '').replace(/\/api$/i, '')}/api`
+        : '/api'
+      : resolveApiPrefix();
+
+  if (overrideBase === undefined && !hasConfiguredBackend()) {
+    return false;
+  }
+
   try {
-    const res = await fetch(`${API_BASE}/health`);
-    return res.ok;
+    const res = await fetch(`${prefix}/health`);
+    if (!res.ok) return false;
+    const data = await res.json().catch(() => null);
+    return data?.status === 'ok';
   } catch {
     return false;
   }
 }
 
 export async function inspectBookUrl(url: string): Promise<InspectedBook> {
-  return requestJson<InspectedBook>(`${API_BASE}/inspect`, {
+  return requestJson<InspectedBook>('/inspect', {
     method: 'POST',
     body: JSON.stringify({ url }),
   });
@@ -46,13 +110,13 @@ export async function inspectBookUrl(url: string): Promise<InspectedBook> {
 
 export async function listRecentInspections(): Promise<InspectionSummary[]> {
   const data = await requestJson<{ inspections: InspectionSummary[] }>(
-    `${API_BASE}/inspections`,
+    '/inspections',
   );
   return data.inspections;
 }
 
 export async function listJobs(): Promise<JobRecord[]> {
-  const data = await requestJson<{ jobs: JobRecord[] }>(`${API_BASE}/jobs`);
+  const data = await requestJson<{ jobs: JobRecord[] }>('/jobs');
   return data.jobs;
 }
 
@@ -63,7 +127,7 @@ export async function createDownloadJob(params: {
   pageRange: string;
   title?: string;
 }): Promise<JobRecord> {
-  const data = await requestJson<{ job: JobRecord }>(`${API_BASE}/jobs`, {
+  const data = await requestJson<{ job: JobRecord }>('/jobs', {
     method: 'POST',
     body: JSON.stringify(params),
   });
@@ -72,7 +136,7 @@ export async function createDownloadJob(params: {
 
 export async function cancelJob(jobId: string): Promise<JobRecord> {
   const data = await requestJson<{ job: JobRecord }>(
-    `${API_BASE}/jobs/${encodeURIComponent(jobId)}/cancel`,
+    `/jobs/${encodeURIComponent(jobId)}/cancel`,
     { method: 'POST' },
   );
   return data.job;
@@ -80,18 +144,18 @@ export async function cancelJob(jobId: string): Promise<JobRecord> {
 
 export async function deleteJob(jobId: string): Promise<void> {
   await requestJson<{ deleted: boolean }>(
-    `${API_BASE}/jobs/${encodeURIComponent(jobId)}`,
+    `/jobs/${encodeURIComponent(jobId)}`,
     { method: 'DELETE' },
   );
 }
 
 export function getDownloadUrl(jobId: string): string {
-  return `${API_BASE}/jobs/${encodeURIComponent(jobId)}/download`;
+  return `${resolveApiPrefix()}/jobs/${encodeURIComponent(jobId)}/download`;
 }
 
 export function getProxiedImageUrl(imageUrl: string | null): string | null {
   if (!imageUrl) return null;
-  return `${API_BASE}/proxy/image?url=${encodeURIComponent(imageUrl)}`;
+  return `${resolveApiPrefix()}/proxy/image?url=${encodeURIComponent(imageUrl)}`;
 }
 
 export function subscribeToJob(
@@ -99,7 +163,7 @@ export function subscribeToJob(
   onUpdate: (job: JobRecord) => void,
 ): () => void {
   const source = new EventSource(
-    `${API_BASE}/jobs/${encodeURIComponent(jobId)}/events`,
+    `${resolveApiPrefix()}/jobs/${encodeURIComponent(jobId)}/events`,
   );
 
   source.onmessage = (event) => {
