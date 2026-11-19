@@ -233,27 +233,27 @@ export function App() {
           <LocalBundlerPanel />
         )}
 
-        <section className="guide-strip" aria-label="Keunggulan FlipDown">
+        <section className="guide-strip" aria-label="Fitur FlipDown">
           <div className="guide-item">
-            <h3>Langsung Tanpa Setup API</h3>
+            <h3>Cepat &amp; Praktis</h3>
             <p>
               Cukup tempel link FlipHTML5 publik, pilih format PDF atau Offline
-              HTML5, lalu klik Download. Proses otomatis berjalan di browser Anda.
+              HTML5, lalu langsung simpan ke perangkat Anda.
             </p>
           </div>
           <div className="guide-item">
             <h3>PDF Tajam &amp; Proporsional</h3>
             <p>
-              Setiap halaman WebP, PNG, atau JPG dikonversi otomatis dan disusun
-              rapi menggunakan <code>pdf-lib</code> sesuai rasio asli buku.
+              Setiap halaman disusun otomatis sesuai rasio asli buku dengan
+              pilihan kualitas gambar sesuai kebutuhan.
             </p>
           </div>
           <div className="guide-item">
             <h3>Offline HTML5 Siap Buka</h3>
             <p>
-              Ekstrak file <code>.zip</code> lalu klik dua kali{' '}
-              <code>index.html</code> untuk membaca flipbook offline lengkap
-              dengan tampilan 2 halaman, zoom, dan navigasi keyboard.
+              Ekstrak file <code>.zip</code> lalu buka <code>index.html</code>{' '}
+              untuk membaca flipbook offline lengkap dengan zoom dan navigasi
+              halaman.
             </p>
           </div>
         </section>

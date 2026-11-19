@@ -1217,11 +1217,22 @@ select {
 .direct-submit-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 12px;
-  padding-top: 6px;
+  padding-top: 8px;
   border-top: 1px solid var(--border-subtle);
+}
+
+.direct-download-cta {
+  min-width: 220px;
+}
+
+.nav-pill {
+  white-space: nowrap;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
 }
 
 .preview-inline-card {
@@ -1333,6 +1344,10 @@ select {
     justify-content: center;
     font-size: 0.78rem;
     padding: 8px 10px;
+  }
+
+  .direct-download-cta {
+    width: 100%;
   }
 
   .brand-sub {

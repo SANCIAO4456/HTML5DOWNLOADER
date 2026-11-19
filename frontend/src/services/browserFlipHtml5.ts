@@ -1,3 +1,4 @@
+import JSZip from 'jszip';
 import type { OutputFormat, QualityPreset } from '../types';
 import {
   buildPackageFromRawPages,
@@ -43,6 +44,7 @@ export interface BrowserDownloadResult {
   pageRange: string;
   totalPages: number;
   selectedPages: number;
+  skippedPages: number;
   filename: string;
   fileSize: number;
   blobUrl: string;
@@ -54,6 +56,17 @@ interface NormalizedUrl {
   account: string;
   bookId: string;
   slug: string;
+}
+
+interface DeStringWindow extends Window {
+  allocateUTF8?: (str: string) => number;
+  UTF8ToString?: (ptr: number) => string;
+  Module?: {
+    _DeString?: (ptr: number) => number;
+    _free?: (ptr: number) => void;
+    allocateUTF8?: (str: string) => number;
+    UTF8ToString?: (ptr: number) => string;
+  };
 }
 
 type RelayFn = (targetUrl: string) => string;
@@ -68,17 +81,18 @@ const CORS_RELAYS: Array<{ name: string; build: RelayFn }> = [
     build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
   },
   {
-    name: 'corsproxy',
-    build: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
-  },
-  {
     name: 'corslol',
     build: (u) => `https://api.cors.lol/?url=${encodeURIComponent(u)}`,
+  },
+  {
+    name: 'corsproxy',
+    build: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
   },
 ];
 
 // Remembers the fastest working fetch route ('direct' or relay index) for this session
 let preferredRoute: 'direct' | number | null = null;
+let deStringReadyPromise: Promise<boolean> | null = null;
 
 function isAllowedFlipHost(hostname: string): boolean {
   const host = hostname.trim().toLowerCase().replace(/\.$/, '');
@@ -196,13 +210,23 @@ export function parsePageRange(
   return Array.from(pageSet).sort((a, b) => a - b);
 }
 
+/**
+ * Resolves a FlipHTML5 asset path safely against the book's baseUrl,
+ * normalizing leading `./` and `../` segments from mobile/javascript/config.js.
+ */
 function resolveAssetUrl(assetPath: string, baseUrl: string): string | null {
   const cleaned = assetPath.trim();
   if (!cleaned) return null;
   try {
-    const resolved = cleaned.startsWith('//')
-      ? new URL(`https:${cleaned}`)
-      : new URL(cleaned.replace(/^\.\//, ''), baseUrl);
+    let resolved: URL;
+    if (/^https?:\/\//i.test(cleaned)) {
+      resolved = new URL(cleaned);
+    } else if (cleaned.startsWith('//')) {
+      resolved = new URL(`https:${cleaned}`);
+    } else {
+      const normalizedRel = cleaned.replace(/^(?:\.\.\/|\.\/|\/)+/, '');
+      resolved = new URL(normalizedRel, baseUrl);
+    }
     if (
       (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') ||
       !isAllowedFlipHost(resolved.hostname)
@@ -233,6 +257,141 @@ function detectImageMime(bytes: Uint8Array): string | null {
   if (riff === 'RIFF' && webp === 'WEBP') return 'image/webp';
   if (riff === 'GIF8') return 'image/gif';
   return null;
+}
+
+function isZipBuffer(bytes: Uint8Array): boolean {
+  return (
+    bytes.length >= 4 &&
+    bytes[0] === 0x50 &&
+    bytes[1] === 0x4b &&
+    bytes[2] === 0x03 &&
+    bytes[3] === 0x04
+  );
+}
+
+function loadScriptTag(src: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      resolve();
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
+    document.head.appendChild(script);
+  });
+}
+
+function getDeStringHandles(): {
+  allocateUTF8: (str: string) => number;
+  deString: (ptr: number) => number;
+  utf8ToString: (ptr: number) => string;
+  free?: (ptr: number) => void;
+} | null {
+  const win = window as DeStringWindow;
+  const allocateUTF8 = win.allocateUTF8 ?? win.Module?.allocateUTF8;
+  const utf8ToString = win.UTF8ToString ?? win.Module?.UTF8ToString;
+  const deString = win.Module?._DeString;
+  if (
+    typeof allocateUTF8 === 'function' &&
+    typeof utf8ToString === 'function' &&
+    typeof deString === 'function'
+  ) {
+    return {
+      allocateUTF8,
+      deString,
+      utf8ToString,
+      free: typeof win.Module?._free === 'function' ? win.Module._free : undefined,
+    };
+  }
+  return null;
+}
+
+/**
+ * Loads FlipHTML5's official public deString.js WASM decoder used by modern flipbooks
+ * whose `fliphtml5_pages` manifest is stored as an encoded string.
+ */
+async function ensureDeStringLoaded(): Promise<boolean> {
+  if (getDeStringHandles()) return true;
+  if (deStringReadyPromise) return deStringReadyPromise;
+
+  deStringReadyPromise = (async () => {
+    try {
+      await loadScriptTag(
+        'https://static.fliphtml5.com/resourceFiles/html5_templates/js/jquery-4.0.0.min.js',
+      ).catch(() =>
+        loadScriptTag(
+          'https://static.fliphtml5.com/resourceFiles/html5_templates/js/jquery-3.5.1.min.js',
+        ),
+      );
+      await loadScriptTag(
+        'https://static.fliphtml5.com/resourceFiles/html5_templates/js/deString.js',
+      );
+
+      const deadline = Date.now() + 12000;
+      while (Date.now() < deadline) {
+        if (getDeStringHandles()) return true;
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      return Boolean(getDeStringHandles());
+    } catch {
+      return false;
+    }
+  })();
+
+  const ok = await deStringReadyPromise;
+  if (!ok) {
+    deStringReadyPromise = null;
+  }
+  return ok;
+}
+
+async function decodeEncodedPagesString(
+  encoded: string,
+): Promise<RawPageItem[] | null> {
+  // Some configs simply stringify the JSON array directly
+  const trimmed = encoded.trim();
+  if (trimmed.startsWith('[')) {
+    try {
+      const direct = JSON.parse(trimmed);
+      if (Array.isArray(direct)) return direct as RawPageItem[];
+    } catch {
+      // Proceed to deString decoder
+    }
+  }
+
+  const ready = await ensureDeStringLoaded();
+  const handles = ready ? getDeStringHandles() : null;
+  if (!handles) return null;
+
+  const ptr = handles.allocateUTF8(encoded);
+  try {
+    const outPtr = handles.deString(ptr);
+    let decoded = handles.utf8ToString(outPtr).trim();
+
+    const startIdx = decoded.indexOf('[');
+    const endIdx = decoded.lastIndexOf(']');
+    if (startIdx !== -1 && endIdx > startIdx) {
+      decoded = decoded.slice(startIdx, endIdx + 1);
+    }
+
+    const parsed = JSON.parse(decoded);
+    if (Array.isArray(parsed)) {
+      return parsed as RawPageItem[];
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    try {
+      handles.free?.(ptr);
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
 }
 
 function extractBalancedJson(source: string, startIndex: number): string | null {
@@ -276,7 +435,90 @@ function parsePositiveInt(val: unknown): number | null {
   return null;
 }
 
-function buildFallbackCandidates(
+function expandExtensionVariants(pathWithoutQuery: string): string[] {
+  const [cleanPath, query] = pathWithoutQuery.split('?');
+  const suffix = query ? `?${query}` : '';
+  const hasExt = /\.(webp|jpe?g|png|gif|zip)$/i.test(cleanPath);
+
+  if (!hasExt) {
+    return [
+      `${cleanPath}.webp${suffix}`,
+      `${cleanPath}.jpg${suffix}`,
+      `${cleanPath}.png${suffix}`,
+      `${cleanPath}${suffix}`,
+    ];
+  }
+
+  const variants = [`${cleanPath}${suffix}`];
+  if (/\.webp$/i.test(cleanPath)) {
+    variants.push(`${cleanPath.replace(/\.webp$/i, '.jpg')}${suffix}`);
+  } else if (/\.jpe?g$/i.test(cleanPath)) {
+    variants.push(`${cleanPath.replace(/\.jpe?g$/i, '.webp')}${suffix}`);
+  }
+  return variants;
+}
+
+function buildAssetCandidates(
+  rawAsset: string,
+  baseUrl: string,
+  largePath?: string,
+  normalPath?: string,
+): string[] {
+  const cleaned = rawAsset.trim().replace(/^(?:\.\.\/|\.\/)+/, '');
+  if (!cleaned) return [];
+
+  const out: string[] = [];
+  const pushResolved = (candidate: string) => {
+    const resolved = resolveAssetUrl(candidate, baseUrl);
+    if (resolved && !out.includes(resolved)) out.push(resolved);
+  };
+
+  const expandedNames = expandExtensionVariants(cleaned);
+  const hasDir = cleaned.includes('/') || /^https?:\/\//i.test(cleaned);
+
+  if (hasDir) {
+    for (const variant of expandedNames) {
+      pushResolved(variant);
+    }
+    // Also try filename inside standard FlipHTML5 folders if path prefix changed
+    const fileOnly = cleaned.split('/').pop();
+    if (fileOnly && !/^https?:\/\//i.test(cleaned)) {
+      for (const variant of expandExtensionVariants(fileOnly)) {
+        pushResolved(`files/large/${variant}`);
+        pushResolved(`files/medium/${variant}`);
+        pushResolved(`files/page/${variant}`);
+        pushResolved(`files/mobile/${variant}`);
+      }
+    }
+    return out;
+  }
+
+  const dirs: string[] = [];
+  const addDir = (dir?: string) => {
+    if (!dir) return;
+    const norm = dir.trim().replace(/^(?:\.\.\/|\.\/|\/)+/, '');
+    if (!norm) return;
+    const withSlash = norm.endsWith('/') ? norm : `${norm}/`;
+    if (!dirs.includes(withSlash)) dirs.push(withSlash);
+  };
+
+  addDir(largePath);
+  addDir('files/large/');
+  addDir(normalPath);
+  addDir('files/medium/');
+  addDir('files/page/');
+  addDir('files/mobile/');
+
+  for (const dir of dirs) {
+    for (const variant of expandedNames) {
+      pushResolved(`${dir}${variant}`);
+    }
+  }
+
+  return out;
+}
+
+function buildNumberedFallbackCandidates(
   pageNumber: number,
   baseUrl: string,
   largePath?: string,
@@ -288,25 +530,28 @@ function buildFallbackCandidates(
     if (resolved && !out.includes(resolved)) out.push(resolved);
   };
 
-  if (largePath) {
-    const p = largePath.endsWith('/') ? largePath : `${largePath}/`;
-    push(`${p}${pageNumber}.webp`);
-    push(`${p}${pageNumber}.jpg`);
-    push(`${p}${pageNumber}.png`);
-  }
-  if (normalPath) {
-    const p = normalPath.endsWith('/') ? normalPath : `${normalPath}/`;
-    push(`${p}${pageNumber}.webp`);
-    push(`${p}${pageNumber}.jpg`);
-  }
+  const dirs: string[] = [];
+  const addDir = (dir?: string) => {
+    if (!dir) return;
+    const norm = dir.trim().replace(/^(?:\.\.\/|\.\/|\/)+/, '');
+    if (!norm) return;
+    const withSlash = norm.endsWith('/') ? norm : `${norm}/`;
+    if (!dirs.includes(withSlash)) dirs.push(withSlash);
+  };
 
-  push(`files/large/${pageNumber}.webp`);
-  push(`files/large/${pageNumber}.jpg`);
-  push(`files/page/${pageNumber}.webp`);
-  push(`files/page/${pageNumber}.jpg`);
-  push(`files/mobile/${pageNumber}.webp`);
-  push(`files/mobile/${pageNumber}.jpg`);
-  push(`files/large/${pageNumber}.png`);
+  addDir(largePath);
+  addDir('files/large/');
+  addDir(normalPath);
+  addDir('files/medium/');
+  addDir('files/page/');
+  addDir('files/mobile/');
+  addDir('files/thumb/');
+
+  for (const dir of dirs) {
+    push(`${dir}${pageNumber}.webp`);
+    push(`${dir}${pageNumber}.jpg`);
+    push(`${dir}${pageNumber}.png`);
+  }
   return out;
 }
 
@@ -325,15 +570,16 @@ interface RawConfig {
     pageHeight?: number | string;
     largePath?: string;
     normalPath?: string;
-    fliphtml5_pages?: RawPageItem[];
+    thumbPath?: string;
+    fliphtml5_pages?: RawPageItem[] | string;
   };
-  fliphtml5_pages?: RawPageItem[];
+  fliphtml5_pages?: RawPageItem[] | string;
 }
 
-function parseConfigText(
+async function parseConfigText(
   scriptText: string,
   normalized: NormalizedUrl,
-): BrowserBookMetadata | null {
+): Promise<{ metadata: BrowserBookMetadata; hasExplicitPages: boolean } | null> {
   const marker = scriptText.search(/(?:var|let|const|window\.)\s*htmlConfig\s*=/);
   let parsed: RawConfig | null = null;
   if (marker !== -1) {
@@ -347,16 +593,48 @@ function parseConfigText(
     }
   }
 
-  let rawPages: RawPageItem[] =
-    parsed?.fliphtml5_pages ?? parsed?.bookConfig?.fliphtml5_pages ?? [];
+  let rawPages: RawPageItem[] = [];
+  const rawField = parsed?.fliphtml5_pages ?? parsed?.bookConfig?.fliphtml5_pages;
+
+  if (Array.isArray(rawField)) {
+    rawPages = rawField;
+  } else if (typeof rawField === 'string' && rawField.trim()) {
+    const decoded = await decodeEncodedPagesString(rawField);
+    if (decoded && decoded.length > 0) {
+      rawPages = decoded;
+    }
+  }
+
+  // Fallback regex for standalone `var fliphtml5_pages = [...]` or `var fliphtml5_pages = "..."`
   if (rawPages.length === 0) {
-    const m = scriptText.match(/fliphtml5_pages\s*=\s*(\[[\s\S]*?\])\s*;/);
-    if (m?.[1]) {
+    const arrMatch = scriptText.match(/fliphtml5_pages\s*=\s*(\[[\s\S]*?\])\s*;/);
+    if (arrMatch?.[1]) {
       try {
-        const arr = JSON.parse(m[1]);
+        const arr = JSON.parse(arrMatch[1]);
         if (Array.isArray(arr)) rawPages = arr as RawPageItem[];
       } catch {
         // Ignore malformed array
+      }
+    }
+  }
+
+  if (rawPages.length === 0) {
+    const strMatch = scriptText.match(
+      /["']?fliphtml5_pages["']?\s*[:=]\s*"((?:[^"\\]|\\.){20,})"/,
+    ) ??
+      scriptText.match(
+        /["']?fliphtml5_pages["']?\s*[:=]\s*'((?:[^'\\]|\\.){20,})'/,
+      );
+    if (strMatch?.[1]) {
+      let rawEncoded = strMatch[1];
+      try {
+        rawEncoded = JSON.parse(`"${rawEncoded.replace(/"/g, '\\"')}"`);
+      } catch {
+        // Keep raw captured string if already unescaped
+      }
+      const decoded = await decodeEncodedPagesString(rawEncoded);
+      if (decoded && decoded.length > 0) {
+        rawPages = decoded;
       }
     }
   }
@@ -390,69 +668,77 @@ function parseConfigText(
     const item = rawPages[i];
     const candidates: string[] = [];
 
-    const addAsset = (rawAsset: string) => {
-      const hasDir = rawAsset.includes('/') || /^https?:\/\//i.test(rawAsset);
-      const variants = hasDir
-        ? [rawAsset]
-        : [
-            `files/large/${rawAsset}`,
-            `files/page/${rawAsset}`,
-            `files/mobile/${rawAsset}`,
-            rawAsset,
-          ];
-      for (const variant of variants) {
-        const resolved = resolveAssetUrl(variant, normalized.baseUrl);
-        if (resolved && !candidates.includes(resolved)) candidates.push(resolved);
+    const pushUnique = (urls: string[]) => {
+      for (const u of urls) {
+        if (!candidates.includes(u)) candidates.push(u);
       }
     };
 
     if (item?.n) {
       const list = Array.isArray(item.n) ? item.n : [item.n];
-      list.forEach((entry) => {
-        if (typeof entry === 'string' && entry.trim()) addAsset(entry);
-      });
+      for (const entry of list) {
+        if (typeof entry === 'string' && entry.trim()) {
+          pushUnique(
+            buildAssetCandidates(
+              entry,
+              normalized.baseUrl,
+              bookConfig?.largePath,
+              bookConfig?.normalPath,
+            ),
+          );
+        }
+      }
     }
-
-    buildFallbackCandidates(
-      pageNumber,
-      normalized.baseUrl,
-      bookConfig?.largePath,
-      bookConfig?.normalPath,
-    ).forEach((c) => {
-      if (!candidates.includes(c)) candidates.push(c);
-    });
 
     let thumbUrl: string | null = null;
     if (typeof item?.t === 'string' && item.t.trim()) {
-      const rel =
+      const thumbCandidates = buildAssetCandidates(
         item.t.includes('/') || /^https?:\/\//i.test(item.t)
           ? item.t
-          : `files/thumb/${item.t}`;
-      thumbUrl = resolveAssetUrl(rel, normalized.baseUrl);
+          : `files/thumb/${item.t}`,
+        normalized.baseUrl,
+        bookConfig?.thumbPath,
+      );
+      thumbUrl = thumbCandidates[0] ?? null;
+      // Add thumbnail as last-resort candidate if large/medium fail
+      pushUnique(thumbCandidates);
     }
-    if (!thumbUrl) thumbUrl = candidates[0] ?? null;
 
+    // Add numbered fallbacks only after explicit decoded candidates
+    pushUnique(
+      buildNumberedFallbackCandidates(
+        pageNumber,
+        normalized.baseUrl,
+        bookConfig?.largePath,
+        bookConfig?.normalPath,
+      ),
+    );
+
+    if (!thumbUrl) thumbUrl = candidates[0] ?? null;
     pages.push({ pageNumber, candidates, thumbUrl });
   }
 
   return {
-    url: normalized.normalizedUrl,
-    baseUrl: normalized.baseUrl,
-    bookSlug: normalized.slug,
-    title,
-    description,
-    totalPages,
-    pageWidth,
-    pageHeight,
-    coverUrl: pages[0]?.thumbUrl ?? pages[0]?.candidates[0] ?? null,
-    pages,
+    hasExplicitPages: rawPages.length > 0,
+    metadata: {
+      url: normalized.normalizedUrl,
+      baseUrl: normalized.baseUrl,
+      bookSlug: normalized.slug,
+      title,
+      description,
+      totalPages,
+      pageWidth,
+      pageHeight,
+      coverUrl: pages[0]?.thumbUrl ?? pages[0]?.candidates[0] ?? null,
+      pages,
+    },
   };
 }
 
-function parseHtmlText(
+async function parseHtmlText(
   html: string,
   normalized: NormalizedUrl,
-): BrowserBookMetadata | null {
+): Promise<BrowserBookMetadata | null> {
   const ogTitle = html.match(
     /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
   )?.[1];
@@ -471,14 +757,16 @@ function parseHtmlText(
     ? resolveAssetUrl(ogImage, normalized.baseUrl)
     : null;
 
-  const inline = parseConfigText(html, normalized);
+  const inline = await parseConfigText(html, normalized);
   if (inline) {
     return {
-      ...inline,
+      ...inline.metadata,
       title:
-        inline.title === normalized.slug && htmlTitle ? htmlTitle : inline.title,
-      description: inline.description ?? (ogDesc?.trim() || null),
-      coverUrl: inline.coverUrl ?? resolvedOgImg,
+        inline.metadata.title === normalized.slug && htmlTitle
+          ? htmlTitle
+          : inline.metadata.title,
+      description: inline.metadata.description ?? (ogDesc?.trim() || null),
+      coverUrl: inline.metadata.coverUrl ?? resolvedOgImg,
     };
   }
 
@@ -490,7 +778,10 @@ function parseHtmlText(
 
   const pages: BrowserPageEntry[] = Array.from({ length: totalPages }, (_, i) => {
     const pageNumber = i + 1;
-    const candidates = buildFallbackCandidates(pageNumber, normalized.baseUrl);
+    const candidates = buildNumberedFallbackCandidates(
+      pageNumber,
+      normalized.baseUrl,
+    );
     return { pageNumber, candidates, thumbUrl: candidates[0] ?? null };
   });
 
@@ -531,10 +822,6 @@ async function fetchWithTimeout(
   }
 }
 
-/**
- * Fetches a public FlipHTML5 resource directly from the browser, seamlessly
- * falling back to read-only public CORS relays if the browser blocks cross-origin reads.
- */
 async function smartFetch(
   targetUrl: string,
   signal?: AbortSignal,
@@ -558,25 +845,42 @@ async function smartFetch(
         preferredRoute = route;
         return response;
       }
-      if (response.status === 404 || response.status === 403 || response.status === 401) {
+      if (response.status === 404) {
+        lastResponse = response;
+        if (route === preferredRoute || route === 'direct') {
+          return response;
+        }
+        continue;
+      }
+      if (response.status === 401 || response.status === 403) {
         lastResponse = response;
         if (route === 'direct') {
-          // Real upstream HTTP status without CORS error
-          preferredRoute = 'direct';
           return response;
+        }
+        if (route === preferredRoute) {
+          preferredRoute = null;
+        }
+        continue;
+      }
+      if (response.status === 429 || response.status >= 500) {
+        if (route === preferredRoute) {
+          preferredRoute = null;
         }
       }
     } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError' && signal?.aborted) {
+      if (
+        error instanceof DOMException &&
+        error.name === 'AbortError' &&
+        signal?.aborted
+      ) {
         throw error;
       }
-      // CORS error or relay unavailable -> continue trying next route
     }
   }
 
   if (lastResponse) return lastResponse;
   throw new Error(
-    'Gagal mengambil data dari FlipHTML5 langsung di browser. Pastikan link bersifat publik dan koneksi internet stabil.',
+    'Gagal terhubung ke FlipHTML5. Pastikan link benar dan koneksi internet stabil.',
   );
 }
 
@@ -586,22 +890,36 @@ export async function inspectBookInBrowser(
 ): Promise<BrowserBookMetadata> {
   const normalized = normalizeFlipHtml5Url(rawUrl);
 
+  // Try modern javascript/config.js first, then mobile/javascript/config.js
   const configUrls = [
-    `${normalized.baseUrl}mobile/javascript/config.js`,
     `${normalized.baseUrl}javascript/config.js`,
+    `${normalized.baseUrl}mobile/javascript/config.js`,
   ];
+
+  let fallbackMeta: BrowserBookMetadata | null = null;
 
   for (const configUrl of configUrls) {
     try {
       const res = await smartFetch(configUrl, signal);
       if (res.ok) {
         const text = await res.text();
-        const meta = parseConfigText(text, normalized);
-        if (meta) return meta;
+        const result = await parseConfigText(text, normalized);
+        if (result) {
+          if (result.hasExplicitPages) {
+            return result.metadata;
+          }
+          if (!fallbackMeta) {
+            fallbackMeta = result.metadata;
+          }
+        }
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error;
     }
+  }
+
+  if (fallbackMeta) {
+    return fallbackMeta;
   }
 
   const htmlRes = await smartFetch(normalized.baseUrl, signal);
@@ -616,20 +934,51 @@ export async function inspectBookInBrowser(
   }
 
   const html = await htmlRes.text();
-  const parsed = parseHtmlText(html, normalized);
+  const parsed = await parseHtmlText(html, normalized);
   if (!parsed) {
     throw new Error(
-      'Struktur halaman buku FlipHTML5 tidak dapat dibaca. Pastikan publikasi bersifat publik.',
+      'Daftar halaman buku FlipHTML5 tidak dapat dibaca. Pastikan publikasi bersifat publik.',
     );
   }
   return parsed;
+}
+
+async function extractImageFromResponseBytes(
+  bytes: Uint8Array,
+): Promise<{ bytes: Uint8Array; mimeType: string } | null> {
+  const directMime = detectImageMime(bytes);
+  if (directMime) {
+    return { bytes, mimeType: directMime };
+  }
+
+  // Some FlipHTML5 publications pack page images inside a ZIP file
+  if (isZipBuffer(bytes)) {
+    try {
+      const zip = await JSZip.loadAsync(bytes);
+      const imageEntry = Object.values(zip.files).find(
+        (file) =>
+          !file.dir && /\.(webp|jpe?g|png|gif)$/i.test(file.name),
+      );
+      if (imageEntry) {
+        const extracted = await imageEntry.async('uint8array');
+        const extractedMime = detectImageMime(extracted);
+        if (extractedMime) {
+          return { bytes: extracted, mimeType: extractedMime };
+        }
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
 }
 
 async function fetchPageBytes(
   entry: BrowserPageEntry,
   signal?: AbortSignal,
 ): Promise<RawPageBytes> {
-  let lastReason = 'Tidak ada kandidat URL gambar.';
+  let lastReason = 'URL gambar halaman tidak ditemukan.';
 
   for (const candidateUrl of entry.candidates) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -640,12 +989,16 @@ async function fetchPageBytes(
         continue;
       }
       const buffer = await response.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
-      const mimeType = detectImageMime(bytes);
-      if (mimeType) {
-        return { pageNumber: entry.pageNumber, bytes, mimeType };
+      const rawBytes = new Uint8Array(buffer);
+      const extracted = await extractImageFromResponseBytes(rawBytes);
+      if (extracted) {
+        return {
+          pageNumber: entry.pageNumber,
+          bytes: extracted.bytes,
+          mimeType: extracted.mimeType,
+        };
       }
-      lastReason = 'Respons bukan file gambar yang valid.';
+      lastReason = 'Respons bukan gambar yang valid.';
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') throw error;
       lastReason = error instanceof Error ? error.message : String(error);
@@ -664,8 +1017,8 @@ export function getDisplayImageUrl(rawUrl: string | null): string | null {
 }
 
 /**
- * Full zero-API 1-click flow:
- * Paste FlipHTML5 URL -> inspect -> download pages -> build PDF or Offline HTML5 ZIP -> auto-save!
+ * Full 1-click flow:
+ * Paste FlipHTML5 URL -> inspect & decode manifest -> download pages -> build PDF or Offline HTML5 ZIP -> auto-save!
  */
 export async function downloadFlipBookDirectly(options: {
   url: string;
@@ -691,7 +1044,7 @@ export async function downloadFlipBookDirectly(options: {
   onProgress({
     phase: 'fetching_meta',
     progress: 5,
-    label: 'Membaca informasi buku FlipHTML5...',
+    label: 'Membaca daftar halaman FlipHTML5...',
     downloadedPages: 0,
     selectedPages: 0,
     totalPages: prefetchedBook?.totalPages ?? 0,
@@ -717,8 +1070,10 @@ export async function downloadFlipBookDirectly(options: {
     .filter((entry): entry is BrowserPageEntry => Boolean(entry));
 
   const downloaded: RawPageBytes[] = [];
+  const failedPages: number[] = [];
+  let firstErrorMessage = '';
   let cursor = 0;
-  let doneCount = 0;
+  let processedCount = 0;
   const workerCount = Math.min(4, entries.length);
 
   const workers = Array.from({ length: workerCount }, async () => {
@@ -728,19 +1083,29 @@ export async function downloadFlipBookDirectly(options: {
       cursor += 1;
       if (idx >= entries.length) break;
 
-      const pageBytes = await fetchPageBytes(entries[idx], signal);
-      downloaded.push(pageBytes);
-      doneCount += 1;
+      const entry = entries[idx];
+      try {
+        const pageBytes = await fetchPageBytes(entry, signal);
+        downloaded.push(pageBytes);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') throw err;
+        failedPages.push(entry.pageNumber);
+        if (!firstErrorMessage) {
+          firstErrorMessage =
+            err instanceof Error ? err.message : String(err);
+        }
+      }
 
+      processedCount += 1;
       const pct = Math.min(
         78,
-        10 + Math.round((doneCount / entries.length) * 68),
+        10 + Math.round((processedCount / entries.length) * 68),
       );
       onProgress({
         phase: 'downloading',
         progress: pct,
-        label: `Mengunduh halaman ${doneCount} / ${entries.length}...`,
-        downloadedPages: doneCount,
+        label: `Mengunduh halaman ${downloaded.length} / ${entries.length}...`,
+        downloadedPages: downloaded.length,
         selectedPages: entries.length,
         totalPages: book.totalPages,
         title: finalTitle,
@@ -750,6 +1115,13 @@ export async function downloadFlipBookDirectly(options: {
 
   await Promise.all(workers);
 
+  if (downloaded.length === 0) {
+    throw new Error(
+      firstErrorMessage ||
+        'Tidak ada halaman yang dapat diunduh dari publikasi ini.',
+    );
+  }
+
   onProgress({
     phase: 'packaging',
     progress: 80,
@@ -757,7 +1129,7 @@ export async function downloadFlipBookDirectly(options: {
       format === 'pdf'
         ? 'Menyusun dokumen PDF...'
         : 'Mengemas paket Offline HTML5 (.zip)...',
-    downloadedPages: doneCount,
+    downloadedPages: downloaded.length,
     selectedPages: entries.length,
     totalPages: book.totalPages,
     title: finalTitle,
@@ -776,7 +1148,7 @@ export async function downloadFlipBookDirectly(options: {
         phase: 'packaging',
         progress: pct,
         label,
-        downloadedPages: doneCount,
+        downloadedPages: downloaded.length,
         selectedPages: entries.length,
         totalPages: book.totalPages,
         title: finalTitle,
@@ -791,7 +1163,7 @@ export async function downloadFlipBookDirectly(options: {
     phase: 'completed',
     progress: 100,
     label: `Selesai! ${built.filename} langsung terunduh.`,
-    downloadedPages: doneCount,
+    downloadedPages: downloaded.length,
     selectedPages: entries.length,
     totalPages: book.totalPages,
     title: finalTitle,
@@ -808,7 +1180,8 @@ export async function downloadFlipBookDirectly(options: {
         ? 'all'
         : pageRange.trim() || 'all',
     totalPages: book.totalPages,
-    selectedPages: selectedNumbers.length,
+    selectedPages: downloaded.length,
+    skippedPages: failedPages.length,
     filename: built.filename,
     fileSize: built.size,
     blobUrl,

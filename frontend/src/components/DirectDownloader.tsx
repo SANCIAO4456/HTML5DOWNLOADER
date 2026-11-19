@@ -150,12 +150,11 @@ export function DirectDownloader({
     <section className="hero-section" id="top">
       <div className="hero-copy">
         <h1 className="hero-title">
-          Tempel link FlipHTML5, pilih format, langsung terunduh.
+          Download FlipHTML5 ke PDF &amp; Offline HTML5
         </h1>
         <p className="hero-subtitle">
-          Tanpa perlu setup API atau server. Masukkan link publikasi FlipHTML5
-          publik Anda untuk langsung mengunduh sebagai dokumen <strong>PDF</strong>{' '}
-          atau paket <strong>Offline HTML5 (.zip)</strong> lengkap dengan viewer.
+          Tempel link buku FlipHTML5, pilih format yang diinginkan, lalu klik
+          download.
         </p>
       </div>
 
@@ -187,7 +186,7 @@ export function DirectDownloader({
                 className="btn btn-secondary"
                 onClick={handlePreview}
                 disabled={previewLoading || downloading || !url.trim()}
-                title="Lihat info judul & jumlah halaman sebelum unduh"
+                title="Lihat judul & jumlah halaman sebelum unduh"
               >
                 {previewLoading ? (
                   <>
@@ -259,7 +258,7 @@ export function DirectDownloader({
           )}
 
           <div className="field-group">
-            <span className="field-label">Pilih Format Unduhan</span>
+            <span className="field-label">Format Unduhan</span>
             <div
               className="format-options"
               role="radiogroup"
@@ -315,7 +314,7 @@ export function DirectDownloader({
           <div className="config-grid">
             <div className="field-group">
               <label htmlFor="page-range-input" className="field-label">
-                Halaman yang Diunduh
+                Halaman
               </label>
               <input
                 id="page-range-input"
@@ -348,37 +347,27 @@ export function DirectDownloader({
                 <option value="medium">Sedang (hingga 1280px — Seimbang)</option>
                 <option value="compact">Ringan (hingga 960px — File Kecil)</option>
               </select>
-              <span className="field-help">
-                Semua konversi berjalan langsung di browser Anda.
-              </span>
             </div>
           </div>
 
           <div className="direct-submit-row">
-            <span className="inspector-hints">
-              Mendukung{' '}
-              <span className="mono-sample">
-                online.fliphtml5.com/&lt;user&gt;/&lt;buku&gt;/
-              </span>
-            </span>
-
             <button
               id="direct-download-btn"
               type="submit"
-              className="btn btn-primary"
+              className="btn btn-primary direct-download-cta"
               disabled={downloading || !url.trim()}
             >
               {downloading ? (
                 <>
                   <Loader2 size={17} className="spin" aria-hidden="true" />
-                  <span>Memproses Unduhan...</span>
+                  <span>Mengunduh...</span>
                 </>
               ) : (
                 <>
                   <Download size={17} aria-hidden="true" />
                   <span>
                     {format === 'pdf'
-                      ? 'Download PDF Sekarang'
+                      ? 'Download PDF'
                       : 'Download Offline HTML5 (.zip)'}
                   </span>
                 </>
@@ -438,8 +427,10 @@ export function DirectDownloader({
             <span>
               Berhasil! <strong>{lastSuccess.filename}</strong> (
               {lastSuccess.selectedPages} halaman &middot;{' '}
-              {formatFileSize(lastSuccess.fileSize)}) otomatis tersimpan ke folder
-              Downloads Anda.
+              {formatFileSize(lastSuccess.fileSize)})
+              {lastSuccess.skippedPages > 0
+                ? ` — ${lastSuccess.skippedPages} halaman tidak tersedia dilewati.`
+                : ' langsung tersimpan ke folder Downloads Anda.'}
             </span>
           </div>
           <a

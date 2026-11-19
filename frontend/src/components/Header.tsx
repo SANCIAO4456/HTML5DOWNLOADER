@@ -17,16 +17,9 @@ export function Header({ historyCount }: HeaderProps) {
         </a>
 
         <nav className="header-meta" aria-label="Navigasi utama">
-          <a href="#archive-history" className="nav-link">
+          <a href="#archive-history" className="nav-link nav-pill">
             Riwayat ({historyCount})
           </a>
-          <span
-            className="status-indicator"
-            title="Berjalan langsung di browser tanpa perlu setup API"
-          >
-            <span className="status-dot online" aria-hidden="true" />
-            <span>Tanpa API &middot; Langsung Unduh</span>
-          </span>
         </nav>
       </div>
     </header>

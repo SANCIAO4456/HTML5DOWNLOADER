@@ -27,7 +27,7 @@ import type { OutputFormat, QualityPreset } from '../types';
 
 export function LocalBundlerPanel() {
   const [pages, setPages] = useState<LocalPageItem[]>([]);
-  const [title, setTitle] = useState('My Offline Flipbook');
+  const [title, setTitle] = useState('Buku Flipbook Saya');
   const [format, setFormat] = useState<OutputFormat>('pdf');
   const [quality, setQuality] = useState<QualityPreset>('high');
   const [dragActive, setDragActive] = useState(false);
@@ -59,7 +59,7 @@ export function LocalBundlerPanel() {
       file.type.startsWith('image/'),
     );
     if (accepted.length === 0) {
-      setError('Please select valid image files (JPEG, PNG, or WebP).');
+      setError('Pilih file gambar yang valid (JPG, PNG, atau WebP).');
       return;
     }
 
@@ -117,7 +117,7 @@ export function LocalBundlerPanel() {
     setBuilding(true);
     setError(null);
     setLastResult(null);
-    setProgress({ percent: 4, label: 'Preparing browser studio...' });
+    setProgress({ percent: 4, label: 'Menyiapkan halaman...' });
 
     try {
       const result = await buildClientPackage({
@@ -130,7 +130,7 @@ export function LocalBundlerPanel() {
       setLastResult(result);
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : 'Failed to build package in browser.',
+        err instanceof Error ? err.message : 'Gagal menyusun file unduhan.',
       );
     } finally {
       setBuilding(false);
@@ -143,15 +143,14 @@ export function LocalBundlerPanel() {
       : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 
   return (
-    <section className="folio-panel" aria-label="Browser-side PDF and Offline HTML5 studio">
+    <section className="folio-panel" aria-label="Susun dari gambar lokal">
       <form className="local-studio-form" onSubmit={handleExport}>
         <div className="local-studio-head">
           <div>
-            <h2 className="section-title">Browser PDF &amp; Offline HTML5 Studio</h2>
+            <h2 className="section-title">Susun PDF &amp; Offline HTML5 dari Gambar</h2>
             <p className="hero-subtitle">
-              Runs 100% locally inside your browser — zero server needed. Drop
-              page images in order to build a print-ready PDF or standalone
-              offline HTML5 flipbook archive.
+              Pilih kumpulan gambar halaman untuk digabung menjadi satu PDF atau
+              paket Offline HTML5 (.zip).
             </p>
           </div>
           {pages.length > 0 && (
@@ -161,7 +160,7 @@ export function LocalBundlerPanel() {
               onClick={clearAll}
             >
               <Trash2 size={15} />
-              <span>Clear ({pages.length})</span>
+              <span>Hapus ({pages.length})</span>
             </button>
           )}
         </div>
@@ -199,24 +198,24 @@ export function LocalBundlerPanel() {
           />
           <ImagePlus size={26} strokeWidth={1.7} />
           <span className="dropzone-title">
-            Drop book page images here, or click to browse
+            Tarik gambar halaman ke sini, atau klik untuk memilih file
           </span>
           <span className="dropzone-sub">
-            Supports JPG, PNG, WebP &middot; Automatically sorted numerically (page-1, page-2, ..., page-10)
+            Mendukung JPG, PNG, WebP &middot; Otomatis diurutkan sesuai nomor halaman
           </span>
         </div>
 
         {pages.length > 0 && (
-          <div className="local-pages-grid" aria-label="Selected pages">
+          <div className="local-pages-grid" aria-label="Daftar halaman">
             {pages.map((item, idx) => (
               <div className="local-page-tile" key={item.id}>
                 <div className="local-page-thumb">
-                  <img src={item.previewUrl} alt={`Page ${idx + 1}`} />
+                  <img src={item.previewUrl} alt={`Halaman ${idx + 1}`} />
                   <span className="local-page-badge">{idx + 1}</span>
                   <button
                     type="button"
                     className="local-page-remove"
-                    title="Remove page"
+                    title="Hapus halaman"
                     onClick={() => removePage(item.id)}
                   >
                     <X size={13} />
@@ -227,7 +226,7 @@ export function LocalBundlerPanel() {
                     type="button"
                     className="mini-order-btn"
                     disabled={idx === 0}
-                    title="Move earlier"
+                    title="Geser ke kiri"
                     onClick={() => movePage(idx, -1)}
                   >
                     <ArrowLeft size={13} />
@@ -239,7 +238,7 @@ export function LocalBundlerPanel() {
                     type="button"
                     className="mini-order-btn"
                     disabled={idx === pages.length - 1}
-                    title="Move later"
+                    title="Geser ke kanan"
                     onClick={() => movePage(idx, 1)}
                   >
                     <ArrowRight size={13} />
@@ -251,18 +250,21 @@ export function LocalBundlerPanel() {
         )}
 
         <div className="field-group">
-          <span className="field-label">Export Format</span>
+          <span className="field-label">Format Unduhan</span>
           <div className="format-options">
             <button
               type="button"
               className={`format-option ${format === 'pdf' ? 'selected' : ''}`}
               onClick={() => setFormat('pdf')}
             >
-              <FileText size={19} style={{ flexShrink: 0, marginTop: 2, color: 'var(--accent)' }} />
+              <FileText
+                size={19}
+                style={{ flexShrink: 0, marginTop: 2, color: 'var(--accent)' }}
+              />
               <span>
-                <span className="format-option-title">PDF Document (.pdf)</span>
+                <span className="format-option-title">Dokumen PDF (.pdf)</span>
                 <span className="format-option-desc">
-                  Compiled directly in your browser using pdf-lib.
+                  Gabungkan semua gambar menjadi satu file PDF rapi.
                 </span>
               </span>
             </button>
@@ -271,11 +273,14 @@ export function LocalBundlerPanel() {
               className={`format-option ${format === 'html5' ? 'selected' : ''}`}
               onClick={() => setFormat('html5')}
             >
-              <FileArchive size={19} style={{ flexShrink: 0, marginTop: 2, color: 'var(--accent)' }} />
+              <FileArchive
+                size={19}
+                style={{ flexShrink: 0, marginTop: 2, color: 'var(--accent)' }}
+              />
               <span>
                 <span className="format-option-title">Offline HTML5 (.zip)</span>
                 <span className="format-option-desc">
-                  Standalone flipbook viewer ZIP — unzip and open index.html offline.
+                  Paket buku HTML5 mandiri — ekstrak &amp; buka index.html offline.
                 </span>
               </span>
             </button>
@@ -285,7 +290,7 @@ export function LocalBundlerPanel() {
         <div className="config-grid">
           <div className="field-group">
             <label htmlFor="local-title-input" className="field-label">
-              Publication Title
+              Nama File
             </label>
             <input
               id="local-title-input"
@@ -298,7 +303,7 @@ export function LocalBundlerPanel() {
 
           <div className="field-group">
             <label htmlFor="local-quality-select" className="field-label">
-              Image Resolution
+              Kualitas Gambar
             </label>
             <select
               id="local-quality-select"
@@ -306,10 +311,10 @@ export function LocalBundlerPanel() {
               value={quality}
               onChange={(e) => setQuality(e.target.value as QualityPreset)}
             >
-              <option value="original">Original (Full Resolution)</option>
-              <option value="high">High (Up to 1800px)</option>
-              <option value="medium">Medium (Up to 1280px)</option>
-              <option value="compact">Compact (Up to 960px)</option>
+              <option value="high">Tinggi (hingga 1800px)</option>
+              <option value="original">Asli (Resolusi Penuh)</option>
+              <option value="medium">Sedang (hingga 1280px)</option>
+              <option value="compact">Ringan (hingga 960px)</option>
             </select>
           </div>
         </div>
@@ -340,32 +345,30 @@ export function LocalBundlerPanel() {
           <div className="alert-banner alert-success" role="status">
             <CheckCircle2 size={17} style={{ flexShrink: 0, marginTop: 1 }} />
             <span>
-              Saved <strong>{lastResult.filename}</strong> ({formatKb(lastResult.size)}) to your downloads folder.
+              Tersimpan: <strong>{lastResult.filename}</strong> (
+              {formatKb(lastResult.size)}).
             </span>
           </div>
         )}
 
-        <div className="config-actions">
-          <span className="field-help">
-            All processing stays private on your device — files are never uploaded.
-          </span>
+        <div className="direct-submit-row">
           <button
             type="submit"
-            className="btn btn-primary"
+            className="btn btn-primary direct-download-cta"
             disabled={pages.length === 0 || building}
           >
             {building ? (
               <>
                 <Loader2 size={17} className="spin" />
-                <span>Building...</span>
+                <span>Menyusun...</span>
               </>
             ) : (
               <>
                 <Download size={17} />
                 <span>
                   {format === 'pdf'
-                    ? `Build PDF (${pages.length} pages)`
-                    : `Build Offline HTML5 ZIP (${pages.length} pages)`}
+                    ? `Download PDF (${pages.length} halaman)`
+                    : `Download Offline HTML5 (${pages.length} halaman)`}
                 </span>
               </>
             )}
