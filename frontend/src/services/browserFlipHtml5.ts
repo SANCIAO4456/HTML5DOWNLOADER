@@ -62,6 +62,8 @@ interface DeStringWindow extends Window {
   allocateUTF8?: (str: string) => number;
   UTF8ToString?: (ptr: number) => string;
   Module?: {
+    calledRun?: boolean;
+    runtimeInitialized?: boolean;
     _DeString?: (ptr: number) => number;
     _free?: (ptr: number) => void;
     allocateUTF8?: (str: string) => number;
@@ -212,7 +214,7 @@ export function parsePageRange(
 
 /**
  * Resolves a FlipHTML5 asset path safely against the book's baseUrl,
- * normalizing leading `./` and `../` segments from mobile/javascript/config.js.
+ * normalizing leading `./` and `../` segments from config.js.
  */
 function resolveAssetUrl(assetPath: string, baseUrl: string): string | null {
   const cleaned = assetPath.trim();
@@ -292,9 +294,16 @@ function getDeStringHandles(): {
   free?: (ptr: number) => void;
 } | null {
   const win = window as DeStringWindow;
-  const allocateUTF8 = win.allocateUTF8 ?? win.Module?.allocateUTF8;
-  const utf8ToString = win.UTF8ToString ?? win.Module?.UTF8ToString;
-  const deString = win.Module?._DeString;
+  const mod = win.Module;
+  // Critical: Emscripten exports _DeString & allocateUTF8 BEFORE WASM runtime initializes.
+  // Calling allocateUTF8 before `calledRun` is true throws "malloc called before runtime initialization".
+  if (!mod || !mod.calledRun) {
+    return null;
+  }
+
+  const allocateUTF8 = win.allocateUTF8 ?? mod.allocateUTF8;
+  const utf8ToString = win.UTF8ToString ?? mod.UTF8ToString;
+  const deString = mod._DeString;
   if (
     typeof allocateUTF8 === 'function' &&
     typeof utf8ToString === 'function' &&
@@ -304,15 +313,15 @@ function getDeStringHandles(): {
       allocateUTF8,
       deString,
       utf8ToString,
-      free: typeof win.Module?._free === 'function' ? win.Module._free : undefined,
+      free: typeof mod._free === 'function' ? mod._free : undefined,
     };
   }
   return null;
 }
 
 /**
- * Loads FlipHTML5's official public deString.js WASM decoder used by modern flipbooks
- * whose `fliphtml5_pages` manifest is stored as an encoded string.
+ * Loads FlipHTML5's official self-contained deString.js WASM decoder and waits
+ * until the Emscripten WASM runtime (`Module.calledRun === true`) is fully ready.
  */
 async function ensureDeStringLoaded(): Promise<boolean> {
   if (getDeStringHandles()) return true;
@@ -321,20 +330,13 @@ async function ensureDeStringLoaded(): Promise<boolean> {
   deStringReadyPromise = (async () => {
     try {
       await loadScriptTag(
-        'https://static.fliphtml5.com/resourceFiles/html5_templates/js/jquery-4.0.0.min.js',
-      ).catch(() =>
-        loadScriptTag(
-          'https://static.fliphtml5.com/resourceFiles/html5_templates/js/jquery-3.5.1.min.js',
-        ),
-      );
-      await loadScriptTag(
         'https://static.fliphtml5.com/resourceFiles/html5_templates/js/deString.js',
       );
 
-      const deadline = Date.now() + 12000;
+      const deadline = Date.now() + 15000;
       while (Date.now() < deadline) {
         if (getDeStringHandles()) return true;
-        await new Promise((r) => setTimeout(r, 120));
+        await new Promise((r) => setTimeout(r, 60));
       }
       return Boolean(getDeStringHandles());
     } catch {
@@ -349,17 +351,26 @@ async function ensureDeStringLoaded(): Promise<boolean> {
   return ok;
 }
 
-async function decodeEncodedPagesString(
+/**
+ * Decodes an encoded FlipHTML5 string (`bookConfig`, `fliphtml5_pages`, or `meta`)
+ * into a parsed JSON object or array, stripping any trailing checksum suffix.
+ */
+async function decodeFlipStringToJson<T>(
   encoded: string,
-): Promise<RawPageItem[] | null> {
-  // Some configs simply stringify the JSON array directly
+  expectedType: 'array' | 'object',
+): Promise<T | null> {
   const trimmed = encoded.trim();
-  if (trimmed.startsWith('[')) {
-    try {
-      const direct = JSON.parse(trimmed);
-      if (Array.isArray(direct)) return direct as RawPageItem[];
-    } catch {
-      // Proceed to deString decoder
+  const openChar = expectedType === 'array' ? '[' : '{';
+  const closeChar = expectedType === 'array' ? ']' : '}';
+
+  if (trimmed.startsWith(openChar)) {
+    const endIdx = trimmed.lastIndexOf(closeChar);
+    if (endIdx !== -1) {
+      try {
+        return JSON.parse(trimmed.slice(0, endIdx + 1)) as T;
+      } catch {
+        // Proceed to WASM decoder
+      }
     }
   }
 
@@ -370,19 +381,16 @@ async function decodeEncodedPagesString(
   const ptr = handles.allocateUTF8(encoded);
   try {
     const outPtr = handles.deString(ptr);
-    let decoded = handles.utf8ToString(outPtr).trim();
+    const decoded = handles.utf8ToString(outPtr).trim();
 
-    const startIdx = decoded.indexOf('[');
-    const endIdx = decoded.lastIndexOf(']');
-    if (startIdx !== -1 && endIdx > startIdx) {
-      decoded = decoded.slice(startIdx, endIdx + 1);
+    const startIdx = decoded.indexOf(openChar);
+    const endIdx = decoded.lastIndexOf(closeChar);
+    if (startIdx === -1 || endIdx <= startIdx) {
+      return null;
     }
 
-    const parsed = JSON.parse(decoded);
-    if (Array.isArray(parsed)) {
-      return parsed as RawPageItem[];
-    }
-    return null;
+    const slice = decoded.slice(startIdx, endIdx + 1);
+    return JSON.parse(slice) as T;
   } catch {
     return null;
   } finally {
@@ -435,6 +443,20 @@ function parsePositiveInt(val: unknown): number | null {
   return null;
 }
 
+function normalizePathList(value: string | string[] | undefined): string[] {
+  if (!value) return [];
+  const items = Array.isArray(value) ? value : [value];
+  const result: string[] = [];
+  for (const item of items) {
+    if (typeof item !== 'string') continue;
+    const norm = item.trim().replace(/^(?:\.\.\/|\.\/|\/)+/, '');
+    if (!norm) continue;
+    const withSlash = norm.endsWith('/') ? norm : `${norm}/`;
+    if (!result.includes(withSlash)) result.push(withSlash);
+  }
+  return result;
+}
+
 function expandExtensionVariants(pathWithoutQuery: string): string[] {
   const [cleanPath, query] = pathWithoutQuery.split('?');
   const suffix = query ? `?${query}` : '';
@@ -461,8 +483,8 @@ function expandExtensionVariants(pathWithoutQuery: string): string[] {
 function buildAssetCandidates(
   rawAsset: string,
   baseUrl: string,
-  largePath?: string,
-  normalPath?: string,
+  largePaths: string[],
+  normalPaths: string[],
 ): string[] {
   const cleaned = rawAsset.trim().replace(/^(?:\.\.\/|\.\/)+/, '');
   if (!cleaned) return [];
@@ -480,7 +502,6 @@ function buildAssetCandidates(
     for (const variant of expandedNames) {
       pushResolved(variant);
     }
-    // Also try filename inside standard FlipHTML5 folders if path prefix changed
     const fileOnly = cleaned.split('/').pop();
     if (fileOnly && !/^https?:\/\//i.test(cleaned)) {
       for (const variant of expandExtensionVariants(fileOnly)) {
@@ -494,17 +515,13 @@ function buildAssetCandidates(
   }
 
   const dirs: string[] = [];
-  const addDir = (dir?: string) => {
-    if (!dir) return;
-    const norm = dir.trim().replace(/^(?:\.\.\/|\.\/|\/)+/, '');
-    if (!norm) return;
-    const withSlash = norm.endsWith('/') ? norm : `${norm}/`;
-    if (!dirs.includes(withSlash)) dirs.push(withSlash);
+  const addDir = (dir: string) => {
+    if (dir && !dirs.includes(dir)) dirs.push(dir);
   };
 
-  addDir(largePath);
+  largePaths.forEach(addDir);
   addDir('files/large/');
-  addDir(normalPath);
+  normalPaths.forEach(addDir);
   addDir('files/medium/');
   addDir('files/page/');
   addDir('files/mobile/');
@@ -521,8 +538,8 @@ function buildAssetCandidates(
 function buildNumberedFallbackCandidates(
   pageNumber: number,
   baseUrl: string,
-  largePath?: string,
-  normalPath?: string,
+  largePaths: string[],
+  normalPaths: string[],
 ): string[] {
   const out: string[] = [];
   const push = (rel: string) => {
@@ -531,17 +548,13 @@ function buildNumberedFallbackCandidates(
   };
 
   const dirs: string[] = [];
-  const addDir = (dir?: string) => {
-    if (!dir) return;
-    const norm = dir.trim().replace(/^(?:\.\.\/|\.\/|\/)+/, '');
-    if (!norm) return;
-    const withSlash = norm.endsWith('/') ? norm : `${norm}/`;
-    if (!dirs.includes(withSlash)) dirs.push(withSlash);
+  const addDir = (dir: string) => {
+    if (dir && !dirs.includes(dir)) dirs.push(dir);
   };
 
-  addDir(largePath);
+  largePaths.forEach(addDir);
   addDir('files/large/');
-  addDir(normalPath);
+  normalPaths.forEach(addDir);
   addDir('files/medium/');
   addDir('files/page/');
   addDir('files/mobile/');
@@ -560,20 +573,48 @@ interface RawPageItem {
   t?: string;
 }
 
-interface RawConfig {
-  meta?: { title?: string; description?: string };
-  bookConfig?: {
-    bookTitle?: string;
-    totalPageCount?: number | string;
-    pageCount?: number | string;
-    pageWidth?: number | string;
-    pageHeight?: number | string;
-    largePath?: string;
-    normalPath?: string;
-    thumbPath?: string;
-    fliphtml5_pages?: RawPageItem[] | string;
-  };
+interface RawBookConfigObj {
+  bookTitle?: string;
+  bookDescription?: string;
+  totalPageCount?: number | string;
+  pageCount?: number | string;
+  pageWidth?: number | string;
+  pageHeight?: number | string;
+  largePageWidth?: number | string;
+  largePageHeight?: number | string;
+  largePath?: string | string[];
+  normalPath?: string | string[];
+  thumbPath?: string | string[];
   fliphtml5_pages?: RawPageItem[] | string;
+}
+
+interface RawMetaObj {
+  title?: string;
+  description?: string;
+  pageCount?: number | string;
+  pageWidth?: number | string;
+  pageHeight?: number | string;
+}
+
+interface RawConfig {
+  meta?: RawMetaObj | string;
+  bookConfig?: RawBookConfigObj | string;
+  fliphtml5_pages?: RawPageItem[] | string;
+}
+
+function pickBestTitle(
+  metaTitle: string | undefined,
+  bookTitle: string | undefined,
+  slug: string,
+): string {
+  const cleanMeta = metaTitle?.trim() || '';
+  const cleanBook = bookTitle?.trim() || '';
+  const isGeneric = (val: string) =>
+    !val || /^fliphtml5$/i.test(val) || /^untitled$/i.test(val);
+
+  if (!isGeneric(cleanMeta)) return cleanMeta;
+  if (!isGeneric(cleanBook)) return cleanBook;
+  return cleanMeta || cleanBook || slug;
 }
 
 async function parseConfigText(
@@ -593,19 +634,45 @@ async function parseConfigText(
     }
   }
 
+  // Decode meta if it's an encoded string
+  let meta: RawMetaObj | undefined;
+  if (typeof parsed?.meta === 'string' && parsed.meta.trim()) {
+    meta =
+      (await decodeFlipStringToJson<RawMetaObj>(parsed.meta, 'object')) ??
+      undefined;
+  } else if (parsed?.meta && typeof parsed.meta === 'object') {
+    meta = parsed.meta;
+  }
+
+  // Decode bookConfig if it's an encoded string (standard in 2025/2026 FlipHTML5 books!)
+  let bookConfig: RawBookConfigObj | undefined;
+  if (typeof parsed?.bookConfig === 'string' && parsed.bookConfig.trim()) {
+    bookConfig =
+      (await decodeFlipStringToJson<RawBookConfigObj>(
+        parsed.bookConfig,
+        'object',
+      )) ?? undefined;
+  } else if (parsed?.bookConfig && typeof parsed.bookConfig === 'object') {
+    bookConfig = parsed.bookConfig;
+  }
+
+  // Decode fliphtml5_pages (can be array OR encoded string)
   let rawPages: RawPageItem[] = [];
-  const rawField = parsed?.fliphtml5_pages ?? parsed?.bookConfig?.fliphtml5_pages;
+  const rawField = parsed?.fliphtml5_pages ?? bookConfig?.fliphtml5_pages;
 
   if (Array.isArray(rawField)) {
     rawPages = rawField;
   } else if (typeof rawField === 'string' && rawField.trim()) {
-    const decoded = await decodeEncodedPagesString(rawField);
-    if (decoded && decoded.length > 0) {
+    const decoded = await decodeFlipStringToJson<RawPageItem[]>(
+      rawField,
+      'array',
+    );
+    if (Array.isArray(decoded) && decoded.length > 0) {
       rawPages = decoded;
     }
   }
 
-  // Fallback regex for standalone `var fliphtml5_pages = [...]` or `var fliphtml5_pages = "..."`
+  // Fallback regex for standalone `var fliphtml5_pages = [...]` or `= "..."`
   if (rawPages.length === 0) {
     const arrMatch = scriptText.match(/fliphtml5_pages\s*=\s*(\[[\s\S]*?\])\s*;/);
     if (arrMatch?.[1]) {
@@ -619,48 +686,60 @@ async function parseConfigText(
   }
 
   if (rawPages.length === 0) {
-    const strMatch = scriptText.match(
-      /["']?fliphtml5_pages["']?\s*[:=]\s*"((?:[^"\\]|\\.){20,})"/,
-    ) ??
-      scriptText.match(
-        /["']?fliphtml5_pages["']?\s*[:=]\s*'((?:[^'\\]|\\.){20,})'/,
-      );
+    const strMatch =
+      scriptText.match(/["']?fliphtml5_pages["']?\s*[:=]\s*"((?:[^"\\]|\\.){20,})"/) ??
+      scriptText.match(/["']?fliphtml5_pages["']?\s*[:=]\s*'((?:[^'\\]|\\.){20,})'/);
     if (strMatch?.[1]) {
       let rawEncoded = strMatch[1];
       try {
         rawEncoded = JSON.parse(`"${rawEncoded.replace(/"/g, '\\"')}"`);
       } catch {
-        // Keep raw captured string if already unescaped
+        // Keep raw captured string
       }
-      const decoded = await decodeEncodedPagesString(rawEncoded);
-      if (decoded && decoded.length > 0) {
+      const decoded = await decodeFlipStringToJson<RawPageItem[]>(
+        rawEncoded,
+        'array',
+      );
+      if (Array.isArray(decoded) && decoded.length > 0) {
         rawPages = decoded;
       }
     }
   }
 
-  const bookConfig = parsed?.bookConfig;
-  const meta = parsed?.meta;
   const totalPages =
     rawPages.length ||
     parsePositiveInt(bookConfig?.totalPageCount) ||
     parsePositiveInt(bookConfig?.pageCount) ||
+    parsePositiveInt(meta?.pageCount) ||
     parsePositiveInt(
       scriptText.match(/["']?totalPageCount["']?\s*[:=]\s*["']?(\d+)/)?.[1],
+    ) ||
+    parsePositiveInt(
+      scriptText.match(/["']?pageCount["']?\s*[:=]\s*["']?(\d+)/)?.[1],
     );
 
   if (!totalPages) return null;
 
   const titleMatch = scriptText.match(/["']?bookTitle["']?\s*[:=]\s*"([^"]+)"/);
-  const title = (
-    bookConfig?.bookTitle ||
-    meta?.title ||
-    titleMatch?.[1] ||
-    normalized.slug
-  ).trim();
-  const description = meta?.description?.trim() || null;
-  const pageWidth = parsePositiveInt(bookConfig?.pageWidth);
-  const pageHeight = parsePositiveInt(bookConfig?.pageHeight);
+  const title = pickBestTitle(
+    meta?.title,
+    bookConfig?.bookTitle || titleMatch?.[1],
+    normalized.slug,
+  );
+  const description =
+    meta?.description?.trim() || bookConfig?.bookDescription?.trim() || null;
+  const pageWidth =
+    parsePositiveInt(bookConfig?.largePageWidth) ||
+    parsePositiveInt(bookConfig?.pageWidth) ||
+    parsePositiveInt(meta?.pageWidth);
+  const pageHeight =
+    parsePositiveInt(bookConfig?.largePageHeight) ||
+    parsePositiveInt(bookConfig?.pageHeight) ||
+    parsePositiveInt(meta?.pageHeight);
+
+  const largePaths = normalizePathList(bookConfig?.largePath);
+  const normalPaths = normalizePathList(bookConfig?.normalPath);
+  const thumbPaths = normalizePathList(bookConfig?.thumbPath);
 
   const pages: BrowserPageEntry[] = [];
   for (let i = 0; i < totalPages; i += 1) {
@@ -682,8 +761,8 @@ async function parseConfigText(
             buildAssetCandidates(
               entry,
               normalized.baseUrl,
-              bookConfig?.largePath,
-              bookConfig?.normalPath,
+              largePaths,
+              normalPaths,
             ),
           );
         }
@@ -697,20 +776,19 @@ async function parseConfigText(
           ? item.t
           : `files/thumb/${item.t}`,
         normalized.baseUrl,
-        bookConfig?.thumbPath,
+        thumbPaths,
+        [],
       );
       thumbUrl = thumbCandidates[0] ?? null;
-      // Add thumbnail as last-resort candidate if large/medium fail
       pushUnique(thumbCandidates);
     }
 
-    // Add numbered fallbacks only after explicit decoded candidates
     pushUnique(
       buildNumberedFallbackCandidates(
         pageNumber,
         normalized.baseUrl,
-        bookConfig?.largePath,
-        bookConfig?.normalPath,
+        largePaths,
+        normalPaths,
       ),
     );
 
@@ -781,6 +859,8 @@ async function parseHtmlText(
     const candidates = buildNumberedFallbackCandidates(
       pageNumber,
       normalized.baseUrl,
+      [],
+      [],
     );
     return { pageNumber, candidates, thumbUrl: candidates[0] ?? null };
   });
@@ -890,7 +970,6 @@ export async function inspectBookInBrowser(
 ): Promise<BrowserBookMetadata> {
   const normalized = normalizeFlipHtml5Url(rawUrl);
 
-  // Try modern javascript/config.js first, then mobile/javascript/config.js
   const configUrls = [
     `${normalized.baseUrl}javascript/config.js`,
     `${normalized.baseUrl}mobile/javascript/config.js`,
@@ -951,13 +1030,11 @@ async function extractImageFromResponseBytes(
     return { bytes, mimeType: directMime };
   }
 
-  // Some FlipHTML5 publications pack page images inside a ZIP file
   if (isZipBuffer(bytes)) {
     try {
       const zip = await JSZip.loadAsync(bytes);
       const imageEntry = Object.values(zip.files).find(
-        (file) =>
-          !file.dir && /\.(webp|jpe?g|png|gif)$/i.test(file.name),
+        (file) => !file.dir && /\.(webp|jpe?g|png|gif)$/i.test(file.name),
       );
       if (imageEntry) {
         const extracted = await imageEntry.async('uint8array');
@@ -1016,10 +1093,6 @@ export function getDisplayImageUrl(rawUrl: string | null): string | null {
   return rawUrl;
 }
 
-/**
- * Full 1-click flow:
- * Paste FlipHTML5 URL -> inspect & decode manifest -> download pages -> build PDF or Offline HTML5 ZIP -> auto-save!
- */
 export async function downloadFlipBookDirectly(options: {
   url: string;
   format: OutputFormat;
@@ -1074,7 +1147,7 @@ export async function downloadFlipBookDirectly(options: {
   let firstErrorMessage = '';
   let cursor = 0;
   let processedCount = 0;
-  const workerCount = Math.min(4, entries.length);
+  const workerCount = Math.min(5, entries.length);
 
   const workers = Array.from({ length: workerCount }, async () => {
     while (true) {
@@ -1091,8 +1164,7 @@ export async function downloadFlipBookDirectly(options: {
         if (err instanceof DOMException && err.name === 'AbortError') throw err;
         failedPages.push(entry.pageNumber);
         if (!firstErrorMessage) {
-          firstErrorMessage =
-            err instanceof Error ? err.message : String(err);
+          firstErrorMessage = err instanceof Error ? err.message : String(err);
         }
       }
 

@@ -111,32 +111,37 @@ export async function normalizeBlobToJpeg(
     canvas.width = targetWidth;
     canvas.height = targetHeight;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      throw new Error('Browser Canvas 2D context is unavailable.');
+    try {
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        throw new Error('Browser Canvas 2D context is unavailable.');
+      }
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, targetWidth, targetHeight);
+      ctx.drawImage(decoded.source, 0, 0, targetWidth, targetHeight);
+
+      const outBlob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (result) => {
+            if (result) resolve(result);
+            else reject(new Error('Failed to encode page image to JPEG.'));
+          },
+          'image/jpeg',
+          profile.jpegQuality,
+        );
+      });
+
+      const buffer = await outBlob.arrayBuffer();
+      return {
+        bytes: new Uint8Array(buffer),
+        width: targetWidth,
+        height: targetHeight,
+      };
+    } finally {
+      canvas.width = 0;
+      canvas.height = 0;
     }
-
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, targetWidth, targetHeight);
-    ctx.drawImage(decoded.source, 0, 0, targetWidth, targetHeight);
-
-    const outBlob = await new Promise<Blob>((resolve, reject) => {
-      canvas.toBlob(
-        (result) => {
-          if (result) resolve(result);
-          else reject(new Error('Failed to encode page image to JPEG.'));
-        },
-        'image/jpeg',
-        profile.jpegQuality,
-      );
-    });
-
-    const buffer = await outBlob.arrayBuffer();
-    return {
-      bytes: new Uint8Array(buffer),
-      width: targetWidth,
-      height: targetHeight,
-    };
   } finally {
     decoded.cleanup();
   }
@@ -395,6 +400,10 @@ export async function buildPackageFromRawPages(options: {
       const pdfHeight = Math.max(72, Math.round(height * scale * 100) / 100);
       const page = pdfDoc.addPage([pdfWidth, pdfHeight]);
       page.drawImage(embedded, { x: 0, y: 0, width: pdfWidth, height: pdfHeight });
+      ordered[i].bytes = new Uint8Array(0);
+      if ((i + 1) % 4 === 0) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
     }
 
     onProgress(0.96, 'Menyelesaikan file PDF...');
@@ -425,12 +434,16 @@ export async function buildPackageFromRawPages(options: {
     const padded = String(ordered[i].pageNumber).padStart(4, '0');
     const relPath = `pages/page-${padded}.jpg`;
     zip.file(relPath, bytes);
+    ordered[i].bytes = new Uint8Array(0);
     manifestPages.push({
       pageNumber: ordered[i].pageNumber,
       file: relPath,
       width,
       height,
     });
+    if ((i + 1) % 4 === 0) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
   }
 
   const manifest = {
