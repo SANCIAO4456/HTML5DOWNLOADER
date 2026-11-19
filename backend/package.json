@@ -1,0 +1,29 @@
+{
+  "name": "flipdownloader-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend API, FlipHTML5 parser, PDF/HTML5 bundler, and SQLite job store for FlipDown",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/core.test.ts"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "pdf-lib": "^1.17.1",
+    "sharp": "^0.33.5"
+  },
+  "devDependencies": {
+    "@types/archiver": "^6.0.3",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

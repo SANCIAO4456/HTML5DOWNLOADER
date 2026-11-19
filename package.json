@@ -1,0 +1,21 @@
+{
+  "name": "flipdown-html5downloader",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FlipDown — FlipHTML5 Downloader Web Application (PDF & Offline HTML5 Package Generator)",
+  "scripts": {
+    "install:all": "npm install --prefix backend && npm install --prefix frontend",
+    "dev:backend": "npm run dev --prefix backend",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "dev": "npx concurrently -k -n api,web -c blue,green \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "build:frontend": "npm run build --prefix frontend",
+    "build:backend": "npm run build --prefix backend",
+    "build": "npm run build:frontend && npm run build:backend",
+    "start": "npm run start --prefix backend",
+    "test": "npm test --prefix backend",
+    "typecheck": "npm run typecheck --prefix backend && npm run typecheck --prefix frontend"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
