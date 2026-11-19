@@ -8,6 +8,12 @@ export interface LocalPageItem {
   previewUrl: string;
 }
 
+export interface RawPageBytes {
+  pageNumber: number;
+  bytes: Uint8Array;
+  mimeType: string;
+}
+
 interface QualityProfile {
   maxWidth: number | null;
   jpegQuality: number;
@@ -29,7 +35,7 @@ export function sortFilesNaturally(files: File[]): File[] {
   return [...files].sort((a, b) => naturalCollator.compare(a.name, b.name));
 }
 
-function sanitizeBaseName(name: string): string {
+export function sanitizeBaseName(name: string): string {
   const cleaned = name
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
@@ -49,20 +55,56 @@ function escapeHtml(value: string): string {
     .replaceAll("'", '&#39;');
 }
 
-async function normalizeFileToJpeg(
-  file: File,
+async function decodeImageSource(
+  blob: Blob,
+): Promise<{ source: CanvasImageSource; width: number; height: number; cleanup: () => void }> {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const bitmap = await createImageBitmap(blob);
+      return {
+        source: bitmap,
+        width: bitmap.width,
+        height: bitmap.height,
+        cleanup: () => bitmap.close(),
+      };
+    } catch {
+      // Fallback to HTMLImageElement below (e.g. Safari/certain WebP variants)
+    }
+  }
+
+  const objectUrl = URL.createObjectURL(blob);
+  return await new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      resolve({
+        source: img,
+        width: img.naturalWidth || img.width,
+        height: img.naturalHeight || img.height,
+        cleanup: () => URL.revokeObjectURL(objectUrl),
+      });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('Browser could not decode page image.'));
+    };
+    img.src = objectUrl;
+  });
+}
+
+export async function normalizeBlobToJpeg(
+  blob: Blob,
   quality: QualityPreset,
 ): Promise<{ bytes: Uint8Array; width: number; height: number }> {
-  const bitmap = await createImageBitmap(file);
+  const decoded = await decodeImageSource(blob);
   try {
     const profile = QUALITY_PROFILES[quality];
-    let targetWidth = bitmap.width;
-    let targetHeight = bitmap.height;
+    let targetWidth = decoded.width;
+    let targetHeight = decoded.height;
 
-    if (profile.maxWidth && bitmap.width > profile.maxWidth) {
-      const ratio = profile.maxWidth / bitmap.width;
+    if (profile.maxWidth && decoded.width > profile.maxWidth) {
+      const ratio = profile.maxWidth / decoded.width;
       targetWidth = profile.maxWidth;
-      targetHeight = Math.max(1, Math.round(bitmap.height * ratio));
+      targetHeight = Math.max(1, Math.round(decoded.height * ratio));
     }
 
     const canvas = document.createElement('canvas');
@@ -76,27 +118,27 @@ async function normalizeFileToJpeg(
 
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, targetWidth, targetHeight);
-    ctx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
+    ctx.drawImage(decoded.source, 0, 0, targetWidth, targetHeight);
 
-    const blob = await new Promise<Blob>((resolve, reject) => {
+    const outBlob = await new Promise<Blob>((resolve, reject) => {
       canvas.toBlob(
         (result) => {
           if (result) resolve(result);
-          else reject(new Error(`Failed to encode image "${file.name}".`));
+          else reject(new Error('Failed to encode page image to JPEG.'));
         },
         'image/jpeg',
         profile.jpegQuality,
       );
     });
 
-    const buffer = await blob.arrayBuffer();
+    const buffer = await outBlob.arrayBuffer();
     return {
       bytes: new Uint8Array(buffer),
       width: targetWidth,
       height: targetHeight,
     };
   } finally {
-    bitmap.close();
+    decoded.cleanup();
   }
 }
 
@@ -296,7 +338,7 @@ const OFFLINE_VIEWER_JS = `(function () {
   render();
 })();`;
 
-function triggerBrowserDownload(blob: Blob, filename: string): void {
+export function triggerBrowserDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
@@ -304,58 +346,62 @@ function triggerBrowserDownload(blob: Blob, filename: string): void {
   document.body.appendChild(link);
   link.click();
   link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 /**
- * Generates a PDF or standalone Offline HTML5 ZIP directly inside the browser
- * (works 100% client-side on GitHub Pages without requiring any backend server).
+ * Compiles ordered page image blobs into either a PDF or standalone Offline HTML5 ZIP
+ * completely inside the user's browser.
  */
-export async function buildClientPackage(options: {
-  pages: LocalPageItem[];
+export async function buildPackageFromRawPages(options: {
+  pages: RawPageBytes[];
   title: string;
+  sourceUrl?: string;
   format: OutputFormat;
   quality: QualityPreset;
-  onProgress: (percent: number, label: string) => void;
-}): Promise<{ filename: string; size: number }> {
-  const { pages, title, format, quality, onProgress } = options;
+  onProgress: (fraction: number, label: string) => void;
+  signal?: AbortSignal;
+}): Promise<{ blob: Blob; filename: string; size: number }> {
+  const { pages, title, sourceUrl, format, quality, onProgress, signal } = options;
   if (pages.length === 0) {
-    throw new Error('Add at least one page image before exporting.');
+    throw new Error('Tidak ada halaman yang berhasil diambil untuk diproses.');
   }
 
+  const ordered = [...pages].sort((a, b) => a.pageNumber - b.pageNumber);
   const baseName = sanitizeBaseName(title);
 
   if (format === 'pdf') {
     const pdfDoc = await PDFDocument.create();
     pdfDoc.setTitle(title);
-    pdfDoc.setCreator('FlipDown — Browser PDF Studio');
+    if (sourceUrl) pdfDoc.setSubject(`Archived from ${sourceUrl}`);
+    pdfDoc.setCreator('FlipDown — FlipHTML5 Downloader');
     pdfDoc.setCreationDate(new Date());
 
-    for (let i = 0; i < pages.length; i += 1) {
+    for (let i = 0; i < ordered.length; i += 1) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       onProgress(
-        Math.round(((i + 0.5) / pages.length) * 88),
-        `Processing page ${i + 1} of ${pages.length}...`,
+        (i + 0.5) / ordered.length,
+        `Menyusun halaman PDF ${i + 1} / ${ordered.length}...`,
       );
-      const { bytes, width, height } = await normalizeFileToJpeg(
-        pages[i].file,
-        quality,
-      );
+      const blob = new Blob([new Uint8Array(ordered[i].bytes)], {
+        type: ordered[i].mimeType,
+      });
+      const { bytes, width, height } = await normalizeBlobToJpeg(blob, quality);
       const embedded = await pdfDoc.embedJpg(bytes);
       const maxDim = 1200;
-      const scale = Math.max(width, height) > maxDim ? maxDim / Math.max(width, height) : 1;
+      const scale =
+        Math.max(width, height) > maxDim ? maxDim / Math.max(width, height) : 1;
       const pdfWidth = Math.max(72, Math.round(width * scale * 100) / 100);
       const pdfHeight = Math.max(72, Math.round(height * scale * 100) / 100);
       const page = pdfDoc.addPage([pdfWidth, pdfHeight]);
       page.drawImage(embedded, { x: 0, y: 0, width: pdfWidth, height: pdfHeight });
     }
 
-    onProgress(95, 'Finalizing PDF document...');
+    onProgress(0.96, 'Menyelesaikan file PDF...');
     const pdfBytes = await pdfDoc.save({ useObjectStreams: true });
     const blob = new Blob([new Uint8Array(pdfBytes)], { type: 'application/pdf' });
     const filename = `${baseName}.pdf`;
-    triggerBrowserDownload(blob, filename);
-    onProgress(100, 'PDF saved to your device.');
-    return { filename, size: blob.size };
+    return { blob, filename, size: blob.size };
   }
 
   const zip = new JSZip();
@@ -366,26 +412,32 @@ export async function buildClientPackage(options: {
     height: number;
   }> = [];
 
-  for (let i = 0; i < pages.length; i += 1) {
+  for (let i = 0; i < ordered.length; i += 1) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     onProgress(
-      Math.round(((i + 0.5) / pages.length) * 80),
-      `Encoding page ${i + 1} of ${pages.length}...`,
+      ((i + 0.5) / ordered.length) * 0.85,
+      `Mengemas halaman HTML5 ${i + 1} / ${ordered.length}...`,
     );
-    const { bytes, width, height } = await normalizeFileToJpeg(
-      pages[i].file,
-      quality,
-    );
-    const pageNumber = i + 1;
-    const padded = String(pageNumber).padStart(4, '0');
+    const blob = new Blob([new Uint8Array(ordered[i].bytes)], {
+      type: ordered[i].mimeType,
+    });
+    const { bytes, width, height } = await normalizeBlobToJpeg(blob, quality);
+    const padded = String(ordered[i].pageNumber).padStart(4, '0');
     const relPath = `pages/page-${padded}.jpg`;
     zip.file(relPath, bytes);
-    manifestPages.push({ pageNumber, file: relPath, width, height });
+    manifestPages.push({
+      pageNumber: ordered[i].pageNumber,
+      file: relPath,
+      width,
+      height,
+    });
   }
 
   const manifest = {
     title,
+    sourceUrl: sourceUrl ?? null,
     generatedAt: new Date().toISOString(),
-    generator: 'FlipDown — Browser Offline HTML5 Studio',
+    generator: 'FlipDown — FlipHTML5 Downloader',
     totalPages: manifestPages.length,
     pages: manifestPages,
   };
@@ -394,12 +446,57 @@ export async function buildClientPackage(options: {
   zip.file('assets/viewer.css', OFFLINE_VIEWER_CSS);
   zip.file('assets/viewer.js', OFFLINE_VIEWER_JS);
   zip.file('metadata.json', JSON.stringify(manifest, null, 2));
-  zip.file('book-data.js', `window.__FLIPDOWN_BOOK__ = ${JSON.stringify(manifest)};\n`);
+  zip.file(
+    'book-data.js',
+    `window.__FLIPDOWN_BOOK__ = ${JSON.stringify(manifest)};\n`,
+  );
 
-  onProgress(90, 'Compressing Offline HTML5 ZIP archive...');
+  onProgress(0.92, 'Mengompresi paket Offline HTML5 (.zip)...');
   const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
   const filename = `${baseName}-offline-html5.zip`;
-  triggerBrowserDownload(blob, filename);
-  onProgress(100, 'Offline HTML5 ZIP saved to your device.');
-  return { filename, size: blob.size };
+  return { blob, filename, size: blob.size };
+}
+
+/**
+ * Generates a PDF or standalone Offline HTML5 ZIP from user-selected local image files.
+ */
+export async function buildClientPackage(options: {
+  pages: LocalPageItem[];
+  title: string;
+  format: OutputFormat;
+  quality: QualityPreset;
+  onProgress: (percent: number, label: string) => void;
+}): Promise<{ filename: string; size: number }> {
+  const { pages, title, format, quality, onProgress } = options;
+  if (pages.length === 0) {
+    throw new Error('Pilih minimal satu gambar halaman terlebih dahulu.');
+  }
+
+  const rawPages: RawPageBytes[] = [];
+  for (let i = 0; i < pages.length; i += 1) {
+    const arr = new Uint8Array(await pages[i].file.arrayBuffer());
+    rawPages.push({
+      pageNumber: i + 1,
+      bytes: arr,
+      mimeType: pages[i].file.type || 'image/jpeg',
+    });
+  }
+
+  const result = await buildPackageFromRawPages({
+    pages: rawPages,
+    title,
+    format,
+    quality,
+    onProgress: (fraction, label) =>
+      onProgress(Math.min(99, Math.round(fraction * 100)), label),
+  });
+
+  triggerBrowserDownload(result.blob, result.filename);
+  onProgress(
+    100,
+    format === 'pdf'
+      ? 'PDF berhasil diunduh ke perangkat Anda.'
+      : 'Paket Offline HTML5 ZIP berhasil diunduh ke perangkat Anda.',
+  );
+  return { filename: result.filename, size: result.size };
 }

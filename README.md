@@ -2,12 +2,13 @@
 
 **Live Web App (GitHub Pages):** https://sanciao4456.github.io/HTML5DOWNLOADER/
 
-Full-stack web application for inspecting public **FlipHTML5** publications and archiving them into **PDF documents (`.pdf`)** or **standalone Offline HTML5 Flipbook packages (`.zip`)**, powered by an Express + TypeScript backend, Node.js built-in SQLite (`node:sqlite`), and a React + Vite frontend with built-in zero-server browser studio support.
+Tempel link publikasi **FlipHTML5** publik, pilih **PDF (`.pdf`)** atau **Offline HTML5 (`.zip`)**, lalu klik **Download** — langsung berjalan di browser tanpa perlu setup API atau server!
 
-## Modes
+## Mode Penggunaan
 
-- **Browser Studio (works directly on GitHub Pages with no server):** Drop page images directly in your browser to compile a **PDF** or **Offline HTML5 Flipbook `.zip`** locally using `pdf-lib` and `JSZip` (nothing leaves your device).
-- **Full Backend Mode (FlipHTML5 URL scraping + SQLite history):** Run locally (`npm start`) or deploy `Dockerfile` / `render.yaml` to Render/Railway, then enter your backend URL in the top-right **Static Mode / Backend Settings** button on GitHub Pages.
+- **Download Langsung dari Link FlipHTML5 (Tanpa API — Default di GitHub Pages):** Cukup tempel URL `online.fliphtml5.com/<user>/<buku>/`, atur halaman & kualitas, lalu klik Download. Halaman diambil langsung di browser (dengan fallback relay CORS otomatis), dikonversi dengan `pdf-lib` / `JSZip`, dan otomatis terunduh ke perangkat Anda.
+- **Susun dari Gambar Lokal (Offline Studio):** Drag-and-drop gambar halaman `.jpg`/`.png`/`.webp` langsung di browser untuk dikemas menjadi PDF atau Offline HTML5 Flipbook `.zip`.
+- **Opsional — Self-Hosted Node.js Backend (`backend/`):** Tersedia juga server Express + Sharp + `node:sqlite` beserta `Dockerfile` dan `render.yaml` jika ingin dijalankan sebagai server lokal (`npm start`).
 
 ## Features
 

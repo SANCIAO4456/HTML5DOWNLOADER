@@ -1,35 +1,10 @@
-import { BookMarked, Settings2 } from 'lucide-react';
-import { isGitHubPagesHost } from '../api/client';
+import { BookMarked } from 'lucide-react';
 
 interface HeaderProps {
-  apiOnline: boolean | null;
-  jobCount: number;
-  settingsOpen: boolean;
-  onToggleSettings: () => void;
+  historyCount: number;
 }
 
-export function Header({
-  apiOnline,
-  jobCount,
-  settingsOpen,
-  onToggleSettings,
-}: HeaderProps) {
-  const staticHost = isGitHubPagesHost();
-  const statusClass =
-    apiOnline === true
-      ? 'online'
-      : apiOnline === false && !staticHost
-        ? 'offline'
-        : 'static';
-  const statusLabel =
-    apiOnline === true
-      ? 'Backend Ready'
-      : staticHost
-        ? 'Static Mode'
-        : apiOnline === false
-          ? 'Backend Offline'
-          : 'Checking API';
-
+export function Header({ historyCount }: HeaderProps) {
   return (
     <header className="site-header">
       <div className="header-inner">
@@ -38,26 +13,20 @@ export function Header({
             <BookMarked size={17} strokeWidth={2.1} />
           </span>
           <span className="brand-wordmark">FlipDown</span>
-          <span className="brand-sub">FlipHTML5 Archiver</span>
+          <span className="brand-sub">FlipHTML5 Downloader</span>
         </a>
 
-        <nav className="header-meta" aria-label="Primary">
-          {jobCount > 0 && (
-            <a href="#archive-history" className="nav-link">
-              Archive ({jobCount})
-            </a>
-          )}
-          <button
-            id="backend-settings-btn"
-            type="button"
-            className={`status-btn ${settingsOpen ? 'active' : ''}`}
-            onClick={onToggleSettings}
-            title="Configure FlipDown Backend API URL"
+        <nav className="header-meta" aria-label="Navigasi utama">
+          <a href="#archive-history" className="nav-link">
+            Riwayat ({historyCount})
+          </a>
+          <span
+            className="status-indicator"
+            title="Berjalan langsung di browser tanpa perlu setup API"
           >
-            <span className={`status-dot ${statusClass}`} aria-hidden="true" />
-            <span>{statusLabel}</span>
-            <Settings2 size={14} aria-hidden="true" />
-          </button>
+            <span className="status-dot online" aria-hidden="true" />
+            <span>Tanpa API &middot; Langsung Unduh</span>
+          </span>
         </nav>
       </div>
     </header>
